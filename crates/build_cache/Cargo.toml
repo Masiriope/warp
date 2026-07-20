@@ -25,3 +25,6 @@ warp_errors.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

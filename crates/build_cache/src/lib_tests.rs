@@ -568,8 +568,13 @@ fn process_runner_classifies_spawn_nonzero_and_timeout() {
 #[cfg(unix)]
 #[test]
 fn timeout_returns_bounded_when_descendant_keeps_stdout_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let descendant_pid = temp.path().join("descendant-pid");
     let mut command = Command::new_with_process_group("sh");
-    command.args(["-c", "sleep 5 &"]);
+    command.args([
+        "-c",
+        &format!("sleep 5 & echo $! > {}; wait", descendant_pid.display()),
+    ]);
     let started = Instant::now();
     let result = block_on(run_command_with_timeout(
         command,
@@ -578,6 +583,16 @@ fn timeout_returns_bounded_when_descendant_keeps_stdout_open() {
 
     assert_eq!(result, Err(CacheSetupError::Timeout));
     assert!(started.elapsed() < Duration::from_secs(1));
+    let descendant_pid = fs::read_to_string(descendant_pid)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while unsafe { libc::kill(descendant_pid, 0) } == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_ne!(unsafe { libc::kill(descendant_pid, 0) }, 0);
 }
 
 #[test]

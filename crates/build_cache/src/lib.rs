@@ -318,10 +318,14 @@ async fn run_command_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let output = async {
-        command
+        let child = command.spawn().map_err(|_| CacheSetupError::SpawnFailed)?;
+        let mut process_group = ProcessGroupGuard::new(child.id());
+        let output = child
             .output()
             .await
-            .map_err(|_| CacheSetupError::SpawnFailed)
+            .map_err(|_| CacheSetupError::SpawnFailed);
+        process_group.disarm();
+        output
     };
     let timeout = async {
         Timer::after(timeout).await;
@@ -334,6 +338,54 @@ async fn run_command_with_timeout(
         });
     }
     Ok(output.stdout)
+}
+
+#[cfg(unix)]
+struct ProcessGroupGuard {
+    process_group_id: libc::pid_t,
+    armed: bool,
+}
+
+#[cfg(not(unix))]
+struct ProcessGroupGuard;
+
+impl ProcessGroupGuard {
+    fn new(process_id: u32) -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                process_group_id: process_id
+                    .try_into()
+                    .expect("process IDs fit in libc::pid_t"),
+                armed: true,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = process_id;
+            Self
+        }
+    }
+
+    fn disarm(&mut self) {
+        #[cfg(unix)]
+        {
+            self.armed = false;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // `new_with_process_group` makes the child the process-group leader, so the
+            // negative PID targets that child and every descendant in its group.
+            unsafe {
+                libc::kill(-self.process_group_id, libc::SIGKILL);
+            }
+        }
+    }
 }
 
 /// Set up build caching on the current host.
