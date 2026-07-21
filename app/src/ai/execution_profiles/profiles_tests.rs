@@ -10,6 +10,7 @@ use crate::ai::execution_profiles::{
     AIExecutionProfile, ActionPermission, CloudAIExecutionProfileModel, ExecutionProfileId,
     WriteToPtyPermission,
 };
+use crate::ai::llms::LLMId;
 use crate::ai::mcp::TemplatableMCPServerManager;
 use crate::auth::user::TEST_USER_UID;
 use crate::auth::{AuthStateProvider, UserUid};
@@ -349,6 +350,190 @@ fn migration_imports_owned_legacy_profiles_with_deterministic_keys() {
     });
 }
 
+#[test]
+fn pending_migration_keeps_legacy_default_model_until_import_succeeds() {
+    let _guard = FeatureFlag::FileBackedExecutionProfiles.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        install_singletons(&mut app, AuthStateProvider::new_for_test());
+        let server_id = ServerId::from(507);
+        let legacy_model = LLMId::from("gpt-5-6-sol-high");
+        let legacy_default = owned_legacy_profile(
+            SyncId::ServerId(server_id),
+            server_id,
+            AIExecutionProfile {
+                name: "Default".to_string(),
+                is_default_profile: true,
+                base_model: Some(legacy_model.clone()),
+                ..Default::default()
+            },
+        );
+        CloudModel::handle(&app).update(&mut app, |cloud_model, ctx| {
+            cloud_model.upsert_from_server_object(legacy_default, ctx);
+        });
+
+        let profile_model = app.add_singleton_model(|ctx| {
+            AIExecutionProfilesModel::new(&LaunchMode::new_for_unit_test(), ctx)
+        });
+
+        profile_model.read(&app, |model, ctx| {
+            let default_profile = model.default_profile(ctx);
+            assert_eq!(
+                default_profile.data().base_model,
+                Some(legacy_model.clone())
+            );
+            assert_eq!(default_profile.sync_id(), Some(SyncId::ServerId(server_id)));
+            assert_eq!(default_profile.id(), &ExecutionProfileId::default_profile());
+        });
+        app.read(|ctx| {
+            assert!(
+                !AISettings::as_ref(ctx)
+                    .execution_profiles
+                    .is_value_explicitly_set()
+            );
+        });
+
+        profile_model.update(&mut app, |model, ctx| {
+            model.migrate_settings_profiles(ctx);
+        });
+
+        profile_model.read(&app, |model, ctx| {
+            let default_profile = model.default_profile(ctx);
+            assert_eq!(default_profile.data().base_model, Some(legacy_model));
+            assert_eq!(default_profile.sync_id(), None);
+        });
+        app.read(|ctx| {
+            assert!(
+                AISettings::as_ref(ctx)
+                    .execution_profiles
+                    .is_value_explicitly_set()
+            );
+        });
+    });
+}
+
+#[test]
+fn cloud_initial_load_retries_pending_migration() {
+    let _guard = FeatureFlag::FileBackedExecutionProfiles.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        install_singletons(&mut app, AuthStateProvider::new_for_test());
+        let profile_model = app.add_singleton_model(|ctx| {
+            AIExecutionProfilesModel::new(&LaunchMode::new_for_unit_test(), ctx)
+        });
+        let server_id = ServerId::from(508);
+        let legacy_model = LLMId::from("gpt-5-6-sol-high");
+        let legacy_default = owned_legacy_profile(
+            SyncId::ServerId(server_id),
+            server_id,
+            AIExecutionProfile {
+                name: "Default".to_string(),
+                is_default_profile: true,
+                base_model: Some(legacy_model.clone()),
+                ..Default::default()
+            },
+        );
+
+        CloudModel::handle(&app).update(&mut app, |cloud_model, ctx| {
+            cloud_model.update_objects_from_initial_load(vec![legacy_default], false, false, ctx);
+            ctx.emit(CloudModelEvent::InitialLoadCompleted);
+        });
+
+        profile_model.read(&app, |model, ctx| {
+            assert_eq!(
+                model.default_profile(ctx).data().base_model,
+                Some(legacy_model)
+            );
+            assert_eq!(model.default_profile(ctx).sync_id(), None);
+        });
+        app.read(|ctx| {
+            assert!(
+                AISettings::as_ref(ctx)
+                    .execution_profiles
+                    .is_value_explicitly_set()
+            );
+        });
+    });
+}
+
+#[test]
+fn completed_migration_is_not_reapplied_and_legacy_ids_restore_after_restart() {
+    let _guard = FeatureFlag::FileBackedExecutionProfiles.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        install_singletons(&mut app, AuthStateProvider::new_for_test());
+        let default_server_id = ServerId::from(509);
+        let custom_server_id = ServerId::from(510);
+        let migrated_model = LLMId::from("gpt-5-6-sol-high");
+        let default_profile = owned_legacy_profile(
+            SyncId::ServerId(default_server_id),
+            default_server_id,
+            AIExecutionProfile {
+                name: "Default".to_string(),
+                is_default_profile: true,
+                base_model: Some(migrated_model.clone()),
+                ..Default::default()
+            },
+        );
+        let custom_profile = owned_legacy_profile(
+            SyncId::ServerId(custom_server_id),
+            custom_server_id,
+            AIExecutionProfile {
+                name: "Review".to_string(),
+                ..Default::default()
+            },
+        );
+        CloudModel::handle(&app).update(&mut app, |cloud_model, ctx| {
+            cloud_model.upsert_from_server_object(default_profile, ctx);
+            cloud_model.upsert_from_server_object(custom_profile, ctx);
+        });
+
+        let profile_model = app.add_singleton_model(|ctx| {
+            AIExecutionProfilesModel::new(&LaunchMode::new_for_unit_test(), ctx)
+        });
+        profile_model.update(&mut app, |model, ctx| {
+            model.migrate_settings_profiles(ctx);
+        });
+
+        let changed_legacy_default = owned_legacy_profile(
+            SyncId::ServerId(default_server_id),
+            default_server_id,
+            AIExecutionProfile {
+                name: "Default".to_string(),
+                is_default_profile: true,
+                base_model: Some(LLMId::from("auto-genius")),
+                ..Default::default()
+            },
+        );
+        CloudModel::handle(&app).update(&mut app, |cloud_model, ctx| {
+            cloud_model.upsert_from_server_object(changed_legacy_default, ctx);
+            ctx.emit(CloudModelEvent::InitialLoadCompleted);
+        });
+        profile_model.update(&mut app, |model, ctx| {
+            model.migrate_settings_profiles(ctx);
+        });
+
+        profile_model.read(&app, |model, ctx| {
+            assert_eq!(
+                model.default_profile(ctx).data().base_model,
+                Some(migrated_model)
+            );
+        });
+
+        let restored_model = app
+            .add_model(|ctx| AIExecutionProfilesModel::new(&LaunchMode::new_for_unit_test(), ctx));
+        restored_model.read(&app, |model, ctx| {
+            assert_eq!(
+                model.get_profile_id_by_sync_id(&SyncId::ServerId(default_server_id), ctx,),
+                Some(ExecutionProfileId::default_profile())
+            );
+            assert_eq!(
+                model.get_profile_id_by_sync_id(&SyncId::ServerId(custom_server_id), ctx),
+                Some(ExecutionProfileId::from_legacy_server_id(custom_server_id))
+            );
+        });
+    });
+}
 #[test]
 fn profile_sources_preserve_state_across_migration_and_rollout() {
     App::test((), |mut app| async move {
