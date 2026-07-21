@@ -18,8 +18,9 @@ use warpui_core::presenter::tui::TuiPresenter;
 use warpui_core::{App, AppContext, TuiView, WindowInvalidation};
 
 use super::{
-    INLINE_MENU_TOP_PADDING_ROWS, TuiTerminalSessionEvent, export_file_success_message,
-    log_bundle_success_message, raw_prompt_if_not_blank, render_left_footer_hint,
+    INLINE_MENU_TOP_PADDING_ROWS, LOG_BUNDLE_FAILED_HINT, TuiTerminalSessionEvent,
+    export_file_success_message, log_bundle_success_message, raw_prompt_if_not_blank,
+    render_left_footer_hint,
 };
 use crate::autoupdate::TuiAutoupdater;
 use crate::inline_menu::MAX_INLINE_MENU_ROWS;
@@ -50,6 +51,35 @@ fn log_bundle_success_message_includes_the_absolute_path() {
         log_bundle_success_message(path),
         "Log bundle saved to /tmp/warp-20260718-132640.zip"
     );
+}
+
+#[test]
+fn log_bundle_success_message_shows_resolved_tui_directory_and_name() {
+    // /view-logs success hint must display the absolute path under the resolved
+    // TUI log directory/name, not a GUI or legacy oz path (CODE-1902 spec
+    // criterion #7). On Linux the TUI directory is under the platform state dir
+    // plus `tui`; on macOS it is `~/Library/Logs/tui`. Either way the absolute
+    // path rendered to the user must contain the `tui` segment and the
+    // `warp_tui*` stem, and must not contain `/oz/`.
+    let path = std::path::Path::new(
+        "/home/user/.local/state/warp-terminal-dev/tui/warp_tui_dev-20260721-120000.zip",
+    );
+    let message = log_bundle_success_message(path);
+    assert!(message.starts_with("Log bundle saved to "));
+    assert!(message.contains("/tui/warp_tui_dev-"));
+    assert!(!message.contains("/oz/"));
+}
+
+#[test]
+fn log_bundle_failure_hint_does_not_hardcode_a_frontend_path() {
+    // On reveal failure / SSH skip the failure hint must not embed a GUI, CLI,
+    // or TUI path — only the success hint carries the resolved absolute path,
+    // so the failure branch must stay path-agnostic and never hard-code a
+    // GUI/CLI location (CODE-1902 spec criterion #7).
+    assert!(!LOG_BUNDLE_FAILED_HINT.contains("warp.log"));
+    assert!(!LOG_BUNDLE_FAILED_HINT.contains("/oz/"));
+    assert!(!LOG_BUNDLE_FAILED_HINT.contains("/tui/"));
+    assert!(!LOG_BUNDLE_FAILED_HINT.contains("warp_tui"));
 }
 #[test]
 fn inline_menu_padding_preserves_result_capacity() {
