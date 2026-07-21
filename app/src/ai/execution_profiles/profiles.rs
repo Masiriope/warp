@@ -101,13 +101,13 @@ impl ProfileSource {
         }
     }
 
-    /// Returns whether profiles are read from the file-backed collection.
-    fn uses_settings_backend(self) -> bool {
+    /// Returns whether this source stores profiles in the settings collection.
+    fn is_settings_collection(self) -> bool {
         matches!(self, Self::SettingsCollection { .. })
     }
 
     /// Returns whether this launch performs the one-way legacy import.
-    fn migrates_legacy_cloud_profiles(self) -> bool {
+    fn imports_legacy_profiles(self) -> bool {
         matches!(
             self,
             Self::SettingsCollection {
@@ -115,17 +115,64 @@ impl ProfileSource {
             }
         )
     }
+
+    /// Returns the stable key for a default profile read from the selected source.
+    fn default_profile_id(self) -> ExecutionProfileId {
+        if self.imports_legacy_profiles() {
+            ExecutionProfileId::default_profile()
+        } else {
+            ExecutionProfileId::new()
+        }
+    }
+
+    /// Derives the stable collection key assigned to a legacy cloud object.
+    ///
+    /// Synced non-default profiles derive their key from the server ID so independent clients
+    /// produce the same mapping. A profile that still has only a client ID receives a generated
+    /// key until the server ID arrives.
+    fn legacy_profile_id(self, sync_id: SyncId, is_default_profile: bool) -> ExecutionProfileId {
+        if is_default_profile {
+            return self.default_profile_id();
+        }
+        if !self.imports_legacy_profiles() {
+            return ExecutionProfileId::new();
+        }
+        sync_id
+            .into_server()
+            .map(ExecutionProfileId::from_legacy_server_id)
+            .unwrap_or_else(ExecutionProfileId::new)
+    }
 }
 
+/// Tracks which profile source is authoritative while the settings collection is initialized.
+///
+/// This state is process-local. An explicit [`ExecutionProfiles`] value is the durable signal
+/// that a collection was materialized on a previous launch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SettingsMigrationState {
+    /// No explicit collection is available, so reads continue using owned legacy cloud objects.
     PendingLegacyImport,
+    /// The settings collection is authoritative, but its initial cloud reconciliation is pending.
     PendingExplicitSync,
+    /// The collection needs no further migration work during this process.
     Complete,
 }
 
 impl SettingsMigrationState {
-    fn uses_settings_backend(self) -> bool {
+    /// Selects the initial authority state for a profile source.
+    fn for_launch(source: ProfileSource, settings_profiles_are_explicit: bool) -> Self {
+        match (
+            source.imports_legacy_profiles(),
+            settings_profiles_are_explicit,
+        ) {
+            (true, true) => Self::PendingExplicitSync,
+            (true, false) => Self::PendingLegacyImport,
+            (false, _) => Self::Complete,
+        }
+    }
+
+    /// Returns whether this state permits reads and writes through [`AISettings`].
+    fn settings_are_authoritative(self) -> bool {
         !matches!(self, Self::PendingLegacyImport)
     }
 }
@@ -199,8 +246,8 @@ impl AIExecutionProfilesModel {
     pub(crate) fn new(launch_mode: &LaunchMode, ctx: &mut ModelContext<Self>) -> Self {
         // Resolve the persistence backend before constructing any source-specific state.
         let source = ProfileSource::for_launch_mode(launch_mode);
-        let uses_file_backed_profiles = source.uses_settings_backend();
-        let should_migrate_legacy_cloud_profiles = source.migrates_legacy_cloud_profiles();
+        let uses_file_backed_profiles = source.is_settings_collection();
+        let imports_legacy_profiles = source.imports_legacy_profiles();
 
         // A TUI with no explicit collection seeds its default from the existing
         // local scalar settings, then uses only the collection.
@@ -227,17 +274,12 @@ impl AIExecutionProfilesModel {
         let settings_profiles_are_explicit = AISettings::as_ref(ctx)
             .execution_profiles
             .is_value_explicitly_set();
-        let settings_migration_state = if should_migrate_legacy_cloud_profiles {
-            if settings_profiles_are_explicit {
-                SettingsMigrationState::PendingExplicitSync
-            } else {
-                SettingsMigrationState::PendingLegacyImport
-            }
-        } else {
-            SettingsMigrationState::Complete
-        };
-        let uses_settings_backend =
-            uses_file_backed_profiles && settings_migration_state.uses_settings_backend();
+        // Existing collections are authoritative immediately. A migration-capable launch without
+        // one keeps reading legacy objects until the import has materialized the settings value.
+        let settings_migration_state =
+            SettingsMigrationState::for_launch(source, settings_profiles_are_explicit);
+        let settings_are_authoritative =
+            uses_file_backed_profiles && settings_migration_state.settings_are_authoritative();
 
         // Build the source-specific legacy state. The settings backend does not
         // need cloud IDs; all effective reads still come directly from AISettings.
@@ -254,7 +296,7 @@ impl AIExecutionProfilesModel {
                     default_profile_state,
                     profile_id_to_sync_id,
                     active_profiles_per_session,
-                ) = if uses_settings_backend {
+                ) = if settings_are_authoritative {
                     (
                         DefaultProfileState::Unsynced {
                             id: ExecutionProfileId::default_profile(),
@@ -282,15 +324,7 @@ impl AIExecutionProfilesModel {
 
                     // Insert all non-default profiles from the cloud
                     for cloud_profile in all_profiles_from_cloud.iter().filter(|p| !p.model().string_model.is_default_profile) {
-                        let profile_id = if should_migrate_legacy_cloud_profiles {
-                            cloud_profile
-                                .id
-                                .into_server()
-                                .map(ExecutionProfileId::from_legacy_server_id)
-                                .unwrap_or_else(ExecutionProfileId::new)
-                        } else {
-                            ExecutionProfileId::new()
-                        };
+                        let profile_id = source.legacy_profile_id(cloud_profile.id, false);
                         profile_id_to_sync_id.insert(profile_id, cloud_profile.id);
                     }
 
@@ -300,22 +334,14 @@ impl AIExecutionProfilesModel {
                             match default_profile_from_cloud {
                                 Some(p) => {
                                     let execution_profile_id =
-                                        if should_migrate_legacy_cloud_profiles {
-                                            ExecutionProfileId::default_profile()
-                                        } else {
-                                            ExecutionProfileId::new()
-                                        };
+                                        source.legacy_profile_id(p.id, true);
                                     profile_id_to_sync_id.insert(execution_profile_id.clone(), p.id);
                                     DefaultProfileState::Synced {
                                         id: execution_profile_id,
                                     }
                                 }
                                 None => DefaultProfileState::Unsynced {
-                                    id: if should_migrate_legacy_cloud_profiles {
-                                        ExecutionProfileId::default_profile()
-                                    } else {
-                                        ExecutionProfileId::new()
-                                    },
+                                    id: source.default_profile_id(),
                                     profile: super::create_default_from_legacy_settings(ctx),
                                 },
                             }
@@ -365,7 +391,7 @@ impl AIExecutionProfilesModel {
                 }
             });
 
-            if should_migrate_legacy_cloud_profiles {
+            if imports_legacy_profiles {
                 if ctx.has_singleton_model::<CloudPreferencesSyncer>() {
                     ctx.subscribe_to_model(
                         &CloudPreferencesSyncer::handle(ctx),
@@ -377,7 +403,7 @@ impl AIExecutionProfilesModel {
                     );
                 }
                 ctx.subscribe_to_model(&CloudModel::handle(ctx), |me, _, event, ctx| {
-                    if !me.uses_settings_backend() {
+                    if !me.settings_are_authoritative() {
                         me.handle_cloud_model_event(event, ctx);
                     }
                     if let CloudModelEvent::ObjectSynced {
@@ -458,7 +484,7 @@ impl AIExecutionProfilesModel {
 
         if !uses_file_backed_profiles {
             model.maybe_inherit_from_legacy_settings(ctx);
-        } else if should_migrate_legacy_cloud_profiles
+        } else if imports_legacy_profiles
             && ctx.has_singleton_model::<CloudPreferencesSyncer>()
             && CloudPreferencesSyncer::as_ref(ctx).has_completed_initial_load()
         {
@@ -480,27 +506,16 @@ impl AIExecutionProfilesModel {
             .is_some_and(|owner| profile.permissions().owner == owner)
     }
 
-    fn uses_settings_backend(&self) -> bool {
-        self.source.uses_settings_backend() && self.settings_migration_state.uses_settings_backend()
+    /// Returns whether the settings collection is currently authoritative for profile operations.
+    fn settings_are_authoritative(&self) -> bool {
+        self.source.is_settings_collection()
+            && self.settings_migration_state.settings_are_authoritative()
     }
 
-    fn profile_id_for_legacy_object(
-        &self,
-        sync_id: SyncId,
-        is_default_profile: bool,
-    ) -> ExecutionProfileId {
-        if !self.source.migrates_legacy_cloud_profiles() {
-            return ExecutionProfileId::new();
-        }
-        if is_default_profile {
-            return ExecutionProfileId::default_profile();
-        }
-        sync_id
-            .into_server()
-            .map(ExecutionProfileId::from_legacy_server_id)
-            .unwrap_or_else(ExecutionProfileId::new)
-    }
-
+    /// Snapshots the currently visible legacy-backed profiles into a settings collection.
+    ///
+    /// Local edits use this snapshot to become file-backed without exposing the empty implicit
+    /// settings default.
     fn pending_legacy_profiles(&self, ctx: &AppContext) -> ExecutionProfilesConfig {
         let mut profiles = ExecutionProfilesConfig::default();
         for profile_id in self.get_all_profile_ids() {
@@ -510,6 +525,11 @@ impl AIExecutionProfilesModel {
         }
         profiles
     }
+
+    /// Returns whether settings sync must apply an existing cloud collection before local changes.
+    ///
+    /// Deferring in this state prevents stale legacy or local values from overwriting a newer
+    /// collection received from another client.
     fn cloud_collection_awaiting_reconciliation(ctx: &AppContext) -> bool {
         *CloudPreferencesSettings::as_ref(ctx)
             .settings_sync_enabled
@@ -519,6 +539,10 @@ impl AIExecutionProfilesModel {
                 .contains_key(ExecutionProfiles::storage_key())
     }
 
+    /// Makes a locally edited pending collection authoritative in [`AISettings`].
+    ///
+    /// Returns `false` without changing authority when cloud reconciliation must run first or when
+    /// the collection cannot be persisted.
     fn activate_pending_settings_collection(
         &mut self,
         profiles: ExecutionProfilesConfig,
@@ -582,9 +606,13 @@ impl AIExecutionProfilesModel {
         }
     }
 
-    /// Materializes the account's execution profiles into the file-backed collection.
+    /// Attempts to make the account's file-backed execution-profile collection authoritative.
+    ///
+    /// An explicit collection is reconciled with cloud preferences after their initial-load
+    /// direction is known. Otherwise, owned legacy cloud objects are imported once all have server
+    /// IDs. Missing prerequisites leave the migration pending so a later readiness event can retry.
     pub(crate) fn migrate_settings_profiles(&mut self, ctx: &mut ModelContext<Self>) {
-        if !self.source.migrates_legacy_cloud_profiles()
+        if !self.source.imports_legacy_profiles()
             || self.settings_migration_state == SettingsMigrationState::Complete
         {
             return;
@@ -704,7 +732,7 @@ impl AIExecutionProfilesModel {
 
     /// Returns whether onboarding must leave the existing default profile unchanged.
     pub fn should_preserve_onboarding_profile(&self, ctx: &AppContext) -> bool {
-        if self.uses_settings_backend() {
+        if self.settings_are_authoritative() {
             self.preserve_profile_onboarding_overrides
         } else {
             self.default_profile(ctx).sync_id().is_some()
@@ -762,7 +790,7 @@ impl AIExecutionProfilesModel {
             return Some(profile_id);
         }
 
-        if self.uses_settings_backend() {
+        if self.settings_are_authoritative() {
             let mut profiles = AISettings::as_ref(ctx).execution_profiles.value().clone();
             let mut new_profile = self.default_profile(ctx).data().clone();
             new_profile.name = String::new();
@@ -827,7 +855,7 @@ impl AIExecutionProfilesModel {
             send_telemetry_from_ctx!(TelemetryEvent::AIExecutionProfileDeleted, ctx);
             return;
         }
-        if self.uses_settings_backend() {
+        if self.settings_are_authoritative() {
             if profile_id.is_default() {
                 log::warn!("Attempted to delete default profile (id: {profile_id})");
                 return;
@@ -874,8 +902,8 @@ impl AIExecutionProfilesModel {
 
     // On logout, we need to clear any existing profile state.
     pub fn reset(&mut self) {
-        if self.source.uses_settings_backend() {
-            if self.source.migrates_legacy_cloud_profiles() {
+        if self.source.is_settings_collection() {
+            if self.source.imports_legacy_profiles() {
                 self.settings_migration_state = SettingsMigrationState::PendingExplicitSync;
                 self.preserve_profile_onboarding_overrides = true;
                 self.default_profile_state = DefaultProfileState::Unsynced {
@@ -918,14 +946,14 @@ impl AIExecutionProfilesModel {
     }
 
     pub fn default_profile_id(&self) -> ExecutionProfileId {
-        if self.uses_settings_backend() {
+        if self.settings_are_authoritative() {
             return ExecutionProfileId::default_profile();
         }
         self.default_profile_state.id()
     }
 
     pub fn default_profile(&self, ctx: &AppContext) -> AIExecutionProfileInfo {
-        if self.uses_settings_backend() {
+        if self.settings_are_authoritative() {
             let id = ExecutionProfileId::default_profile();
             let data = AISettings::as_ref(ctx)
                 .execution_profiles
@@ -1005,7 +1033,7 @@ impl AIExecutionProfilesModel {
         profile_id: &ExecutionProfileId,
         ctx: &AppContext,
     ) -> Option<AIExecutionProfileInfo> {
-        if self.uses_settings_backend() {
+        if self.settings_are_authoritative() {
             return AISettings::as_ref(ctx)
                 .execution_profiles
                 .value()
@@ -1048,7 +1076,7 @@ impl AIExecutionProfilesModel {
     }
 
     pub fn get_all_profile_ids(&self) -> Vec<ExecutionProfileId> {
-        if self.uses_settings_backend() {
+        if self.settings_are_authoritative() {
             return self.last_settings_profiles.profile_ids().cloned().collect();
         }
         let default_profile_id = self.default_profile_state.id();
@@ -1064,15 +1092,20 @@ impl AIExecutionProfilesModel {
             .collect()
     }
 
-    /// Look up a local client profile ID from its cloud sync ID.
+    /// Resolves a legacy cloud sync ID to the profile key used by the active backend.
+    ///
+    /// Legacy backends consult their in-memory ID map. Migration-capable settings backends retain
+    /// mappings from the current process, then derive deterministic keys for profiles restored on
+    /// a later launch. Non-migrating settings backends, such as the TUI, have no legacy sync-ID
+    /// mapping.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
     pub fn get_profile_id_by_sync_id(
         &self,
         sync_id: &SyncId,
         ctx: &AppContext,
     ) -> Option<ExecutionProfileId> {
-        if self.uses_settings_backend() {
-            if !self.source.migrates_legacy_cloud_profiles() {
+        if self.settings_are_authoritative() {
+            if !self.source.imports_legacy_profiles() {
                 return None;
             }
             let profiles = AISettings::as_ref(ctx).execution_profiles.value();
@@ -1113,7 +1146,7 @@ impl AIExecutionProfilesModel {
     }
 
     pub fn has_multiple_profiles(&self) -> bool {
-        if self.uses_settings_backend() {
+        if self.settings_are_authoritative() {
             return self.last_settings_profiles.profile_ids().nth(1).is_some();
         }
         let default_profile_id = self.default_profile_state.id();
@@ -1886,7 +1919,7 @@ impl AIExecutionProfilesModel {
             }
             return self.activate_pending_settings_collection(profiles, ctx);
         }
-        if self.uses_settings_backend() {
+        if self.settings_are_authoritative() {
             let mut profiles = AISettings::as_ref(ctx).execution_profiles.value().clone();
             let Some(profile) = profiles.profile_mut(profile_id) else {
                 return false;
@@ -2096,7 +2129,7 @@ impl AIExecutionProfilesModel {
                 continue;
             }
             if !self.profile_id_to_sync_id.values().any(|s| *s == sync_id) {
-                let profile_id = self.profile_id_for_legacy_object(sync_id, false);
+                let profile_id = self.source.legacy_profile_id(sync_id, false);
                 self.profile_id_to_sync_id.insert(profile_id, sync_id);
                 log::info!(
                     "Registered existing cloud execution profile after initial load: {sync_id:?}"
@@ -2173,7 +2206,7 @@ impl AIExecutionProfilesModel {
         // For non-default profiles, add to the map if not already present
         let profile_exists = self.profile_id_to_sync_id.values().any(|id| *id == sync_id);
         if !profile_exists {
-            let profile_id = self.profile_id_for_legacy_object(sync_id, false);
+            let profile_id = self.source.legacy_profile_id(sync_id, false);
             self.profile_id_to_sync_id.insert(profile_id, sync_id);
             log::info!("Added new execution profile to map: {sync_id:?}");
             ctx.emit(AIExecutionProfilesModelEvent::ProfileCreated);
@@ -2269,8 +2302,10 @@ impl AIExecutionProfilesModel {
         }
     }
 
-    // We don't want stale client ids in our map. We won't be able to find the backing cloud object when
-    // an edit occurs.
+    /// Replaces a temporary client sync ID with the server ID assigned after object creation.
+    ///
+    /// While legacy import is pending, this also replaces generated profile keys with their
+    /// deterministic migrated keys and updates active/default references atomically.
     pub fn replace_client_id_with_server_id(&mut self, server_id: SyncId, client_id: SyncId) {
         let Some(profile_id) = self
             .profile_id_to_sync_id
@@ -2282,7 +2317,7 @@ impl AIExecutionProfilesModel {
         let is_default_profile = profile_id == self.default_profile_state.id();
         let migrated_profile_id =
             if self.settings_migration_state == SettingsMigrationState::PendingLegacyImport {
-                self.profile_id_for_legacy_object(server_id, is_default_profile)
+                self.source.legacy_profile_id(server_id, is_default_profile)
             } else {
                 profile_id.clone()
             };

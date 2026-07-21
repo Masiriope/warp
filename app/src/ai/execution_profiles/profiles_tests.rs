@@ -56,6 +56,7 @@ fn owned_legacy_profile(
     )
 }
 
+/// Creates the minimal cloud preference needed to model a previously migrated account.
 fn cloud_execution_profiles_preference(server_id: ServerId) -> ServerPreference {
     ServerPreference::new(
         SyncId::ServerId(server_id),
