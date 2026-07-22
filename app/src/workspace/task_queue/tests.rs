@@ -570,6 +570,91 @@ fn launch_claim_prevents_a_second_terminal_pane_before_the_shell_starts() {
 }
 
 #[test]
+fn restart_recovers_a_linked_in_progress_task_to_attention_required() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+    let created = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("task should persist");
+    let mut running_model = TaskQueueModel::new();
+    running_model
+        .load_from_store(&store)
+        .expect("task should load into the running queue");
+    running_model
+        .launch_with_store(
+            &store,
+            &created.id,
+            AgentKind::Codex,
+            "terminal-pane-before-restart",
+        )
+        .expect("launch should persist before the simulated restart");
+
+    let restarted_model = TaskQueueModel::from_roots_and_store(Vec::new(), &store);
+    let recovered = restarted_model
+        .task(&created.id)
+        .expect("interrupted task should remain visible after restart");
+
+    assert_eq!(recovered.status, TaskStatus::AttentionRequired);
+    assert_eq!(recovered.terminal_pane_id, None);
+    assert!(
+        recovered
+            .attention_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("reinició"))
+    );
+    assert_eq!(
+        store.list().expect("recovered task should persist").tasks,
+        vec![recovered.clone()]
+    );
+}
+
+#[test]
+fn unavailable_workspace_launch_emits_an_update_after_persisting_attention() {
+    App::test((), |mut app| async move {
+        let data = tempfile::tempdir().expect("data directory should be created");
+        let workspace = tempfile::tempdir().expect("workspace should be created");
+        let workspace_path = workspace.path().to_path_buf();
+        let store = TaskStore::open(data.path());
+        let created = store
+            .create(stored_task_input(stored_workspace(&workspace_path)))
+            .expect("task should persist");
+        let queue = app.add_model(|_| TaskQueueModel::new());
+        let notifications = Arc::new(AtomicUsize::new(0));
+        app.update(|ctx| {
+            let notifications = notifications.clone();
+            ctx.subscribe_to_model(&queue, move |_, event: &TaskQueueEvent, _| {
+                if matches!(event, TaskQueueEvent::Updated) {
+                    notifications.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        });
+        queue.update(&mut app, |queue, _| {
+            queue.set_store_for_test(store.clone());
+            queue
+                .load_from_store(&store)
+                .expect("task should load into the queue");
+        });
+        fs::remove_dir_all(&workspace_path).expect("workspace should disappear before launch");
+
+        queue.update(&mut app, |queue, ctx| {
+            assert!(
+                queue
+                    .launch_in_active_store(&created.id, AgentKind::Codex, "terminal-pane-1", ctx)
+                    .is_err()
+            );
+        });
+
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        let task = queue
+            .read(&app, |queue, _| queue.task(&created.id).cloned())
+            .expect("task should stay visible");
+        assert_eq!(task.status, TaskStatus::AttentionRequired);
+        assert_eq!(task.terminal_pane_id, None);
+    });
+}
+
+#[test]
 fn model_uses_discovered_workspace_metadata_when_persisting_an_input_by_id() {
     let data = tempfile::tempdir().expect("data directory should be created");
     let sources = tempfile::tempdir().expect("workspace sources should be created");

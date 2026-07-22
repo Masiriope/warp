@@ -596,7 +596,7 @@ fn linked_task_pty_spawn_failure_requires_attention_without_a_command() {
 }
 
 #[test]
-fn closing_a_linked_task_terminal_requires_attention_and_clears_its_link() {
+fn a_cancelled_terminal_close_request_keeps_the_linked_task_in_progress() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
         let data = tempfile::tempdir().expect("task data directory should be created");
@@ -614,14 +614,27 @@ fn closing_a_linked_task_terminal_requires_attention_and_clears_its_link() {
                 ctx,
             );
         });
+        let launched_tab_count = workspace.read(&app, |workspace, _| workspace.tab_count());
         let terminal = active_terminal(&workspace, &app);
+        // The terminal pane normally turns CloseRequested into a real pane
+        // close. Remove only that pane-level listener to model a close dialog
+        // that the user cancels; the task-launch listener remains installed.
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace
+                .active_tab_pane_group()
+                .update(ctx, |_pane_group, ctx| ctx.unsubscribe_to_view(&terminal));
+        });
         terminal.update(&mut app, |_terminal, ctx| {
             ctx.emit(crate::terminal::Event::CloseRequested);
         });
 
         let task = task_from_queue(&app, &task.id);
-        assert_eq!(task.status, TaskStatus::AttentionRequired);
-        assert_eq!(task.terminal_pane_id, None);
+        assert_eq!(task.status, TaskStatus::InProgress);
+        assert!(task.terminal_pane_id.is_some());
+        assert_eq!(
+            workspace.read(&app, |workspace, _| workspace.tab_count()),
+            launched_tab_count
+        );
     });
 }
 
@@ -652,6 +665,104 @@ fn linked_task_shell_exit_requires_attention_and_clears_its_link() {
         let task = task_from_queue(&app, &task.id);
         assert_eq!(task.status, TaskStatus::AttentionRequired);
         assert_eq!(task.terminal_pane_id, None);
+    });
+}
+
+#[test]
+fn final_persistence_failure_keeps_the_task_linked_until_a_later_terminal_event_recovers_it() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        let task_markdown = store.task_markdown_path(&task.workspace_id, &task.id);
+        let original_markdown =
+            std::fs::read(&task_markdown).expect("task Markdown should be readable");
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+        });
+        let terminal = active_terminal(&workspace, &app);
+        let terminal_pane_id = workspace.read(&app, |workspace, ctx| {
+            workspace
+                .active_tab_pane_group()
+                .as_ref(ctx)
+                .active_session_id(ctx)
+                .expect("task terminal should have a pane id")
+        });
+        terminal.update(&mut app, |_terminal, ctx| {
+            ctx.emit(crate::terminal::Event::ShellSpawned(
+                crate::terminal::shell::ShellType::Zsh,
+            ));
+        });
+        std::fs::remove_file(&task_markdown)
+            .expect("task Markdown should be removed to force final persistence failure");
+        terminal.update(&mut app, |_terminal, ctx| {
+            ctx.emit(crate::terminal::Event::PendingCommandCompleted { success: true });
+        });
+
+        let still_linked = task_from_queue(&app, &task.id);
+        assert_eq!(still_linked.status, TaskStatus::InProgress);
+        assert!(workspace.read(&app, |workspace, _| {
+            workspace
+                .task_terminal_launches
+                .contains_key(&terminal_pane_id)
+        }));
+
+        std::fs::write(&task_markdown, original_markdown)
+            .expect("task Markdown should be restored for recovery");
+        terminal.update(&mut app, |_terminal, ctx| {
+            ctx.emit(crate::terminal::Event::Exited);
+        });
+
+        let recovered = task_from_queue(&app, &task.id);
+        assert_eq!(recovered.status, TaskStatus::AttentionRequired);
+        assert_eq!(recovered.terminal_pane_id, None);
+        assert!(!workspace.read(&app, |workspace, _| {
+            workspace
+                .task_terminal_launches
+                .contains_key(&terminal_pane_id)
+        }));
+    });
+}
+
+#[test]
+fn a_terminal_event_in_another_window_never_finalizes_the_linked_task() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        let task_workspace = mock_workspace(&mut app);
+        let other_workspace = mock_workspace(&mut app);
+
+        task_workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+        });
+        let unrelated_terminal = active_terminal(&other_workspace, &app);
+        unrelated_terminal.update(&mut app, |_terminal, ctx| {
+            ctx.emit(crate::terminal::Event::PendingCommandCompleted { success: true });
+            ctx.emit(crate::terminal::Event::Exited);
+        });
+
+        let task = task_from_queue(&app, &task.id);
+        assert_eq!(task.status, TaskStatus::InProgress);
+        assert!(task.terminal_pane_id.is_some());
     });
 }
 

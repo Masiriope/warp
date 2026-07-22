@@ -17,6 +17,9 @@ use warpui::{Entity, ModelContext, SingletonEntity};
 
 use super::{TaskLoadError, TaskStore, TaskStoreError};
 
+const INTERRUPTED_TASK_LAUNCH_REASON: &str =
+    "La ejecución de la tarea se interrumpió porque Warp se reinició.";
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum TaskStatus {
     Pending,
@@ -713,9 +716,16 @@ impl TaskQueueModel {
         ctx: &mut ModelContext<Self>,
     ) -> Result<Task, TaskQueuePersistError> {
         let store = self.active_store();
-        let task = self.launch_with_store(&store, task_id, agent_kind, terminal_pane_id)?;
-        ctx.emit(TaskQueueEvent::Updated);
-        Ok(task)
+        let result = self.launch_with_store(&store, task_id, agent_kind, terminal_pane_id);
+        if result.is_ok()
+            || matches!(
+                &result,
+                Err(TaskQueuePersistError::WorkspaceUnavailable { .. })
+            )
+        {
+            ctx.emit(TaskQueueEvent::Updated);
+        }
+        result
     }
 
     pub(crate) fn finish_linked_command_in_active_store(
@@ -772,9 +782,47 @@ impl TaskQueueModel {
 
     fn reload_from_store(&mut self, store: &TaskStore) {
         match self.load_from_store(store) {
-            Ok(_) => self.store_load_error = None,
+            Ok(_) => {
+                self.recover_interrupted_task_launches(store);
+                self.store_load_error = None;
+            }
             Err(error) => self.store_load_error = Some(error.to_string()),
         }
+    }
+
+    /// A terminal-pane ID cannot survive a process restart. Startup converts
+    /// those orphaned links into retryable tasks before any workspace renders.
+    fn recover_interrupted_task_launches(&mut self, store: &TaskStore) {
+        let mut recovery_errors = Vec::new();
+        for task in self
+            .tasks
+            .values_mut()
+            .filter(|task| task.status == TaskStatus::InProgress)
+        {
+            let task_path = store.task_markdown_path(&task.workspace_id, &task.id);
+            // InProgress is always a valid source for this transition.
+            if let Err(error) = task.mark_attention_required(INTERRUPTED_TASK_LAUNCH_REASON) {
+                recovery_errors.push(TaskLoadError {
+                    path: task_path,
+                    reason: format!(
+                        "No se pudo recuperar la tarea interrumpida tras reiniciar Warp: {error}"
+                    ),
+                });
+                continue;
+            }
+            if let Err(error) = store.update(task) {
+                // Keep the task retryable in this process even if the backing
+                // store is temporarily unavailable. The next startup retries
+                // the durable normalization rather than hiding the task.
+                recovery_errors.push(TaskLoadError {
+                    path: task_path,
+                    reason: format!(
+                        "No se pudo persistir la recuperación de una tarea interrumpida: {error}"
+                    ),
+                });
+            }
+        }
+        self.load_errors.extend(recovery_errors);
     }
 
     fn reconcile_stored_workspaces(&mut self) {

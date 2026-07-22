@@ -888,18 +888,14 @@ struct TaskTerminalLaunchState {
     finished: bool,
 }
 
-fn task_terminal_can_finish(state: &Arc<Mutex<TaskTerminalLaunchState>>) -> bool {
-    state
-        .lock()
-        .map(|mut state| {
-            if state.finished {
-                false
-            } else {
-                state.finished = true;
-                true
-            }
-        })
-        .unwrap_or(false)
+fn task_terminal_is_active(state: &Arc<Mutex<TaskTerminalLaunchState>>) -> bool {
+    state.lock().map(|state| !state.finished).unwrap_or(false)
+}
+
+fn mark_task_terminal_finished(state: &Arc<Mutex<TaskTerminalLaunchState>>) {
+    if let Ok(mut state) = state.lock() {
+        state.finished = true;
+    }
 }
 
 fn task_terminal_options(workspace_path: PathBuf) -> NewTerminalOptions {
@@ -2585,55 +2581,43 @@ impl Workspace {
                 terminal::Event::PendingCommandCompleted { success } => {
                     let should_finish = state
                         .lock()
-                        .map(|mut state| {
-                            if state.command_sent && !state.finished {
-                                state.finished = true;
-                                true
-                            } else {
-                                false
-                            }
-                        })
+                        .map(|state| state.command_sent && !state.finished)
                         .unwrap_or(false);
-                    if should_finish {
-                        workspace.finish_task_terminal_command(
+                    if should_finish
+                        && workspace.finish_task_terminal_command(
                             terminal_pane_id,
                             &task_id,
                             *success,
                             ctx,
-                        );
+                        )
+                    {
+                        mark_task_terminal_finished(&state);
                         ctx.unsubscribe_to_view(&terminal);
                     }
                 }
                 terminal::Event::PtySpawnFailed { reason } => {
-                    if task_terminal_can_finish(&state) {
-                        workspace.abandon_task_terminal_launch(
+                    if task_terminal_is_active(&state)
+                        && workspace.abandon_task_terminal_launch(
                             terminal_pane_id,
                             &task_id,
                             format!("El terminal no pudo iniciarse: {reason}"),
                             ctx,
-                        );
-                        ctx.unsubscribe_to_view(&terminal);
-                    }
-                }
-                terminal::Event::CloseRequested => {
-                    if task_terminal_can_finish(&state) {
-                        workspace.abandon_task_terminal_launch(
-                            terminal_pane_id,
-                            &task_id,
-                            "El terminal de la tarea se cerró antes de terminar.",
-                            ctx,
-                        );
+                        )
+                    {
+                        mark_task_terminal_finished(&state);
                         ctx.unsubscribe_to_view(&terminal);
                     }
                 }
                 terminal::Event::Exited => {
-                    if task_terminal_can_finish(&state) {
-                        workspace.abandon_task_terminal_launch(
+                    if task_terminal_is_active(&state)
+                        && workspace.abandon_task_terminal_launch(
                             terminal_pane_id,
                             &task_id,
                             "El shell de la tarea terminó antes de completar el comando.",
                             ctx,
-                        );
+                        )
+                    {
+                        mark_task_terminal_finished(&state);
                         ctx.unsubscribe_to_view(&terminal);
                     }
                 }
@@ -2663,10 +2647,7 @@ impl Workspace {
         }
 
         if !workspace_path.is_dir() {
-            if let Ok(mut state) = state.lock() {
-                state.finished = true;
-            }
-            self.abandon_task_terminal_launch(
+            if self.abandon_task_terminal_launch(
                 terminal_pane_id,
                 task_id,
                 format!(
@@ -2674,10 +2655,12 @@ impl Workspace {
                     workspace_path.display()
                 ),
                 ctx,
-            );
-            // This tab remains an ordinary terminal, but it no longer owns a
-            // queue task. Do not keep a stale task-launch subscriber alive.
-            ctx.unsubscribe_to_view(terminal_view);
+            ) {
+                mark_task_terminal_finished(state);
+                // This tab remains an ordinary terminal, but it no longer owns a
+                // queue task. Do not keep a stale task-launch subscriber alive.
+                ctx.unsubscribe_to_view(terminal_view);
+            }
             return;
         }
 
@@ -2704,16 +2687,22 @@ impl Workspace {
         task_id: &TaskId,
         success: bool,
         ctx: &mut ViewContext<Self>,
-    ) {
-        self.task_terminal_launches.remove(&terminal_pane_id);
+    ) -> bool {
         let result = TaskQueueModel::handle(ctx).update(ctx, |queue, ctx| {
             queue.finish_linked_command_in_active_store(task_id, success, ctx)
         });
-        if let Err(error) = result {
-            self.show_task_launch_error(
-                format!("El terminal terminó, pero no se pudo actualizar la tarea: {error}"),
-                ctx,
-            );
+        match result {
+            Ok(_) => {
+                self.task_terminal_launches.remove(&terminal_pane_id);
+                true
+            }
+            Err(error) => {
+                self.show_task_launch_error(
+                    format!("El terminal terminó, pero no se pudo actualizar la tarea: {error}"),
+                    ctx,
+                );
+                false
+            }
         }
     }
 
@@ -2723,9 +2712,13 @@ impl Workspace {
         task_id: &TaskId,
         reason: impl Into<String>,
         ctx: &mut ViewContext<Self>,
-    ) {
-        self.task_terminal_launches.remove(&terminal_pane_id);
-        self.require_task_launch_attention(task_id, reason, ctx);
+    ) -> bool {
+        if self.require_task_launch_attention(task_id, reason, ctx) {
+            self.task_terminal_launches.remove(&terminal_pane_id);
+            true
+        } else {
+            false
+        }
     }
 
     fn require_task_launch_attention(
@@ -2733,7 +2726,7 @@ impl Workspace {
         task_id: &TaskId,
         reason: impl Into<String>,
         ctx: &mut ViewContext<Self>,
-    ) {
+    ) -> bool {
         let reason = reason.into();
         let result = TaskQueueModel::handle(ctx).update(ctx, |queue, ctx| {
             queue.require_linked_task_attention_in_active_store(task_id, reason.clone(), ctx)
@@ -2743,8 +2736,10 @@ impl Workspace {
                 format!("{reason} Tampoco se pudo guardar el diagnóstico: {error}"),
                 ctx,
             );
+            false
         } else {
             self.show_task_launch_error(reason, ctx);
+            true
         }
     }
 
@@ -12373,11 +12368,13 @@ impl Workspace {
         // the tab.
         if self.tabs.len() == 1 {
             if ContextFlag::CloseWindow.is_enabled() {
-                self.abandon_task_launches_in_pane_group(
+                if !self.abandon_task_launches_in_pane_group(
                     &pane_group,
                     "La pestaña de la tarea se cerró antes de terminar.",
                     ctx,
-                );
+                ) {
+                    return;
+                }
                 ctx.close_window();
             }
             return;
@@ -12390,11 +12387,13 @@ impl Workspace {
             detach_panes_for_close && self.try_re_adopt_split_off_child_agent_tab(index, ctx);
 
         if !re_adopted && detach_panes_for_close {
-            self.abandon_task_launches_in_pane_group(
+            if !self.abandon_task_launches_in_pane_group(
                 &pane_group,
                 "La pestaña de la tarea se cerró antes de terminar.",
                 ctx,
-            );
+            ) {
+                return;
+            }
             let working_directories_model = self.working_directories_model.clone();
             pane_group.update(ctx, |pane_group, ctx| {
                 pane_group.for_all_terminal_panes(
@@ -12464,7 +12463,7 @@ impl Workspace {
         pane_group: &ViewHandle<PaneGroup>,
         reason: &str,
         ctx: &mut ViewContext<Self>,
-    ) {
+    ) -> bool {
         let launches = pane_group
             .as_ref(ctx)
             .terminal_pane_ids()
@@ -12479,9 +12478,12 @@ impl Workspace {
             .collect_vec();
 
         for (terminal_pane_id, task_id, terminal_view) in launches {
+            if !self.abandon_task_terminal_launch(terminal_pane_id, &task_id, reason, ctx) {
+                return false;
+            }
             ctx.unsubscribe_to_view(&terminal_view);
-            self.abandon_task_terminal_launch(terminal_pane_id, &task_id, reason, ctx);
         }
+        true
     }
 
     fn should_confirm_close_session(&self, ctx: &mut ViewContext<Self>) -> bool {
