@@ -195,6 +195,7 @@ impl TaskAttachment {
 
     /// Names the stored attachment independently of its source path. Storage
     /// validates this as one safe filename before copying any bytes.
+    #[cfg(test)]
     pub(crate) fn with_file_name(mut self, file_name: impl Into<String>) -> Self {
         self.file_name = Some(file_name.into());
         self
@@ -207,6 +208,7 @@ impl TaskAttachment {
     /// Keeps clipboard data shared from dialog state through the event
     /// boundary. Cloning `NewTaskInput` then clones only this small Arc, never
     /// the untrusted image payload itself.
+    #[cfg(test)]
     pub(crate) fn in_memory_bytes_arc(&self) -> Option<&Arc<[u8]>> {
         self.bytes.as_ref()
     }
@@ -252,6 +254,7 @@ impl NewTaskInput {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_agent_kind(mut self, agent_kind: AgentKind) -> Self {
         self.agent_kind = agent_kind;
         self
@@ -473,6 +476,7 @@ pub(crate) enum TaskQueuePersistError {
 
 #[derive(Default)]
 pub(crate) struct TaskQueueModel {
+    #[cfg(test)]
     sources: Vec<WorkspaceRoot>,
     workspaces: Vec<DiscoveredWorkspace>,
     tasks: HashMap<TaskId, Task>,
@@ -545,10 +549,14 @@ impl TaskQueueModel {
 
     pub(crate) fn discover(&mut self, sources: Vec<WorkspaceRoot>) {
         self.workspaces = discover_workspaces(&sources);
-        self.sources = sources;
+        #[cfg(test)]
+        {
+            self.sources = sources;
+        }
         self.reconcile_stored_workspaces();
     }
 
+    #[cfg(test)]
     pub(crate) fn sources(&self) -> &[WorkspaceRoot] {
         &self.sources
     }

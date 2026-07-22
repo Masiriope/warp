@@ -406,6 +406,7 @@ impl WorkspaceIndexLock {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&path)
             .map_err(|source| TaskStoreError::Io {
                 path: path.clone(),
@@ -506,7 +507,7 @@ fn parse_task_markdown(path: &Path, contents: &str) -> Result<Task, TaskStoreErr
     let mut attachments = Vec::new();
     for attachment in &fields.attachments {
         let reference = validate_attachment_reference(attachment)
-            .map_err(|error| invalid(path, &error.to_string()))?;
+            .map_err(|error| invalid(path, error.to_string()))?;
         if !attachment_references.insert(reference.clone()) {
             return Err(TaskStoreError::DuplicateAttachmentFilename(reference));
         }
@@ -572,7 +573,7 @@ fn parse_front_matter(path: &Path, front_matter: &str) -> Result<FrontMatter, Ta
         if !is_supported_field(key) {
             return Err(invalid(
                 path,
-                &format!("unsupported front matter field {key:?}"),
+                format!("unsupported front matter field {key:?}"),
             ));
         }
         if parsed
@@ -582,7 +583,7 @@ fn parse_front_matter(path: &Path, front_matter: &str) -> Result<FrontMatter, Ta
         {
             return Err(invalid(
                 path,
-                &format!("duplicate front matter field {key:?}"),
+                format!("duplicate front matter field {key:?}"),
             ));
         }
         index += 1;
@@ -614,7 +615,7 @@ fn required_field(path: &Path, fields: &FrontMatter, key: &str) -> Result<String
         .fields
         .get(key)
         .cloned()
-        .ok_or_else(|| invalid(path, &format!("missing required field {key:?}")))
+        .ok_or_else(|| invalid(path, format!("missing required field {key:?}")))
 }
 
 fn required_string(path: &Path, fields: &FrontMatter, key: &str) -> Result<String, TaskStoreError> {
@@ -629,19 +630,19 @@ fn optional_string(
     match fields.fields.get(key).map(String::as_str) {
         Some("null") => Ok(None),
         Some(value) => parse_quoted(path, value).map(Some),
-        None => Err(invalid(path, &format!("missing required field {key:?}"))),
+        None => Err(invalid(path, format!("missing required field {key:?}"))),
     }
 }
 
 fn parse_quoted(path: &Path, value: &str) -> Result<String, TaskStoreError> {
     serde_json::from_str(value)
-        .map_err(|source| invalid(path, &format!("expected a quoted string: {source}")))
+        .map_err(|source| invalid(path, format!("expected a quoted string: {source}")))
 }
 
 fn parse_u64(path: &Path, value: &str, key: &str) -> Result<u64, TaskStoreError> {
     value
         .parse()
-        .map_err(|_| invalid(path, &format!("{key} must be an unsigned integer")))
+        .map_err(|_| invalid(path, format!("{key} must be an unsigned integer")))
 }
 
 fn parse_priority(path: &Path, value: &str) -> Result<TaskPriority, TaskStoreError> {

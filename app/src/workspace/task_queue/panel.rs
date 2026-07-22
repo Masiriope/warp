@@ -71,6 +71,7 @@ pub(crate) fn task_presentation(priority: TaskPriority, status: TaskStatus) -> T
     }
 }
 
+#[cfg(test)]
 pub(crate) fn tasks_for_selected_workspace<'a>(
     tasks: &'a [Task],
     selected_workspace_id: Option<&WorkspaceId>,
@@ -87,11 +88,18 @@ pub(crate) fn tasks_for_selected_workspace<'a>(
 /// Produces concise, readable diagnostics without withholding valid tasks from
 /// the panel when some persisted task entries could not be loaded.
 pub(crate) fn task_queue_diagnostics(
+    initialization_error: Option<&str>,
     load_errors: &[TaskLoadError],
     store_load_error: Option<&str>,
 ) -> Vec<String> {
-    let mut diagnostics =
-        Vec::with_capacity(load_errors.len() + usize::from(store_load_error.is_some()));
+    let mut diagnostics = Vec::with_capacity(
+        load_errors.len()
+            + usize::from(initialization_error.is_some())
+            + usize::from(store_load_error.is_some()),
+    );
+    if let Some(error) = initialization_error {
+        diagnostics.push(format!("No se pudo inicializar la cola de tareas: {error}"));
+    }
     if let Some(error) = store_load_error {
         diagnostics.push(format!("No se pudo cargar la cola de tareas: {error}"));
     }
@@ -129,12 +137,14 @@ impl<T> TaskSessionRow<T> {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LinkedTaskSession<T> {
     pub(crate) session: T,
     pub(crate) task_id: TaskId,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TaskSessionPartition<T> {
     pub(crate) ordinary: Vec<T>,
@@ -184,6 +194,7 @@ pub(crate) struct TaskSessionGroupRow<T> {
 /// Only explicit task metadata participates in this partition. Ordinary Warp
 /// sessions remain ordinary rows; this helper intentionally does not infer an
 /// agent or task relationship from a terminal title, command, or process.
+#[cfg(test)]
 pub(crate) fn partition_task_linked_sessions<T>(
     sessions: impl IntoIterator<Item = TaskSessionRow<T>>,
 ) -> TaskSessionPartition<T> {
@@ -213,7 +224,7 @@ pub(crate) fn task_session_group<T>(
     let mut rows = Vec::new();
     for session in sessions {
         let TaskSessionRow { session, task_id } = session;
-        if let Some(metadata) = task_id.as_ref().and_then(|task_id| task_for_id(task_id)) {
+        if let Some(metadata) = task_id.as_ref().and_then(&task_for_id) {
             rows.push(TaskSessionGroupRow { session, metadata });
         } else {
             ordinary.push(session);
@@ -268,9 +279,13 @@ pub(crate) fn render_task_queue_panel(
         .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
         .with_spacing(TASK_SECTION_GAP);
 
-    if let Some(diagnostics) =
-        render_task_queue_diagnostics(queue.load_errors(), queue.store_load_error(), app)
-    {
+    let initialization_error = queue.initialization_error().map(ToString::to_string);
+    if let Some(diagnostics) = render_task_queue_diagnostics(
+        initialization_error.as_deref(),
+        queue.load_errors(),
+        queue.store_load_error(),
+        app,
+    ) {
         content.add_child(diagnostics);
     }
 
@@ -349,11 +364,12 @@ pub(crate) fn render_task_queue_panel(
 }
 
 fn render_task_queue_diagnostics(
+    initialization_error: Option<&str>,
     load_errors: &[TaskLoadError],
     store_load_error: Option<&str>,
     app: &AppContext,
 ) -> Option<Box<dyn Element>> {
-    let diagnostics = task_queue_diagnostics(load_errors, store_load_error);
+    let diagnostics = task_queue_diagnostics(initialization_error, load_errors, store_load_error);
     if diagnostics.is_empty() {
         return None;
     }
@@ -469,7 +485,7 @@ fn render_task_row(task: &Task, is_selected: bool, app: &AppContext) -> Box<dyn 
         appearance.ui_font_family(),
         11.,
     )
-    .with_color(task_status_color(task.status, app).into())
+    .with_color(task_status_color(task.status, app))
     .finish();
     let row = Container::new(
         Flex::column()

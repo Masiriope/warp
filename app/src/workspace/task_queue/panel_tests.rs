@@ -202,6 +202,7 @@ fn task_panel_selection_only_selects_and_action_mapping_is_deterministic() {
 #[test]
 fn task_queue_diagnostics_surface_partial_load_and_store_failures() {
     let diagnostics = task_queue_diagnostics(
+        None,
         &[TaskLoadError {
             path: PathBuf::from("/private/TaskQueue/broken/task.md"),
             reason: "missing title".to_owned(),
@@ -215,5 +216,15 @@ fn task_queue_diagnostics_surface_partial_load_and_store_failures() {
             "No se pudo cargar la cola de tareas: task directory cannot be read".to_owned(),
             "No se pudo cargar /private/TaskQueue/broken/task.md: missing title".to_owned(),
         ]
+    );
+}
+
+#[test]
+fn task_queue_diagnostics_surface_initialization_failures() {
+    let diagnostics = task_queue_diagnostics(Some("home directory unavailable"), &[], None);
+
+    assert_eq!(
+        diagnostics,
+        vec!["No se pudo inicializar la cola de tareas: home directory unavailable".to_owned(),]
     );
 }
