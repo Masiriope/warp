@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -197,9 +197,8 @@ impl TaskStore {
                 source,
             })?;
             self.sync_file(&destination)?;
-            stored_attachments.push(TaskAttachment::new(
-                Path::new(ATTACHMENTS_DIRECTORY).join(filename),
-            ));
+            let reference = canonical_attachment_reference(&filename)?;
+            stored_attachments.push(TaskAttachment::new(PathBuf::from(reference)));
         }
         task.attachments = stored_attachments;
 
@@ -430,10 +429,9 @@ fn render_task_markdown(task: &Task) -> Result<String, TaskStoreError> {
     markdown.push_str(&format!("updated_at_ms: {}\n", task.updated_at_ms));
     markdown.push_str("schema_version: 1\nattachments:\n");
     for attachment in &task.attachments {
-        let path = attachment.path.to_string_lossy();
-        validate_attachment_reference(&path)?;
+        let reference = canonical_attachment_reference(&attachment_filename(attachment)?)?;
         markdown.push_str("  - ");
-        markdown.push_str(&quoted(&path));
+        markdown.push_str(&quoted(&reference));
         markdown.push('\n');
     }
     markdown.push_str("---\n");
@@ -468,14 +466,12 @@ fn parse_task_markdown(path: &Path, contents: &str) -> Result<Task, TaskStoreErr
     let mut attachment_references = HashSet::new();
     let mut attachments = Vec::new();
     for attachment in &fields.attachments {
-        validate_attachment_reference(attachment)
+        let reference = validate_attachment_reference(attachment)
             .map_err(|error| invalid(path, &error.to_string()))?;
-        if !attachment_references.insert(attachment.clone()) {
-            return Err(TaskStoreError::DuplicateAttachmentFilename(
-                attachment.clone(),
-            ));
+        if !attachment_references.insert(reference.clone()) {
+            return Err(TaskStoreError::DuplicateAttachmentFilename(reference));
         }
-        attachments.push(TaskAttachment::new(attachment.clone()));
+        attachments.push(TaskAttachment::new(PathBuf::from(reference)));
     }
     Ok(Task {
         id: task_id,
@@ -704,29 +700,23 @@ fn validate_attachment_filename(value: &str) -> Result<(), TaskStoreError> {
     Ok(())
 }
 
-fn validate_attachment_reference(value: &str) -> Result<(), TaskStoreError> {
-    let path = Path::new(value);
-    let mut components = path.components();
-    let Some(Component::Normal(directory)) = components.next() else {
+fn canonical_attachment_reference(filename: &str) -> Result<String, TaskStoreError> {
+    validate_attachment_filename(filename)?;
+    Ok(format!("{ATTACHMENTS_DIRECTORY}/{filename}"))
+}
+
+fn validate_attachment_reference(value: &str) -> Result<String, TaskStoreError> {
+    let Some((directory, filename)) = value.split_once('/') else {
         return Err(TaskStoreError::UnsafeAttachmentFilename(value.into()));
     };
     if directory != ATTACHMENTS_DIRECTORY {
         return Err(TaskStoreError::UnsafeAttachmentFilename(value.into()));
     }
-    let Some(Component::Normal(filename)) = components.next() else {
-        return Err(TaskStoreError::UnsafeAttachmentFilename(value.into()));
-    };
-    if components.next().is_some() {
+    let canonical = canonical_attachment_reference(filename)?;
+    if value != canonical {
         return Err(TaskStoreError::UnsafeAttachmentFilename(value.into()));
     }
-    let filename = filename
-        .to_str()
-        .ok_or_else(|| TaskStoreError::UnsafeAttachmentFilename(value.into()))?;
-    validate_attachment_filename(filename)?;
-    if value != format!("{ATTACHMENTS_DIRECTORY}/{filename}") {
-        return Err(TaskStoreError::UnsafeAttachmentFilename(value.into()));
-    }
-    Ok(())
+    Ok(canonical)
 }
 
 fn validate_task_location(task_file: &Path, task: &Task) -> Result<(), TaskStoreError> {
@@ -836,6 +826,31 @@ fn null_terminated_wide(path: &Path) -> Vec<u16> {
 mod storage_tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn attachment_references_are_platform_independent_canonical_strings() {
+        let reference = canonical_attachment_reference("notes.txt")
+            .expect("safe attachment filename should have a canonical reference");
+
+        assert_eq!(reference, "attachments/notes.txt");
+        assert!(!reference.contains('\\'));
+        assert_eq!(
+            validate_attachment_reference(&reference)
+                .expect("canonical attachment reference should validate"),
+            reference
+        );
+        for noncanonical_reference in [
+            "attachments/./notes.txt",
+            "attachments//notes.txt",
+            "attachments/../notes.txt",
+            "attachments\\notes.txt",
+        ] {
+            assert!(
+                validate_attachment_reference(noncanonical_reference).is_err(),
+                "{noncanonical_reference} should be rejected"
+            );
+        }
+    }
 
     #[test]
     fn index_replacement_failure_keeps_the_existing_destination_readable() {
