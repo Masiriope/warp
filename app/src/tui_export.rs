@@ -9,6 +9,11 @@ pub use ::ai::agent::{
 pub use ai::agent::action::{RunAgentsAgentRunConfig, RunAgentsExecutionMode, RunAgentsRequest};
 pub use ai::agent::orchestration_config::{OrchestrationConfig, OrchestrationConfigStatus};
 pub use repo_metadata::repositories::RepoDetectionSource;
+#[cfg(feature = "voice_input")]
+pub use voice_input::{
+    StartListeningError, VoiceInput, VoiceInputState, VoiceInputToggledFrom, VoiceSession,
+    VoiceSessionResult,
+};
 pub use warp_cli::agent::Harness;
 use warp_completer::completer::{CompletionContext as _, TopLevelCommandCaseSensitivity};
 use warp_completer::signatures::CommandRegistry;
@@ -120,6 +125,8 @@ pub use crate::ai::orchestration::{
     resolve_auth_secret_selection_for_harness, resolve_default_environment_id,
     resolve_default_host_slug, should_show_auth_secret_picker,
 };
+#[cfg(feature = "voice_input")]
+pub use crate::ai::request_usage_model::AIRequestUsageModel;
 pub use crate::ai::skills::{SkillManager, SkillReference};
 pub use crate::appearance::Appearance;
 pub use crate::banner::BannerState;
@@ -137,6 +144,8 @@ pub use crate::search::slash_command_menu::static_commands::commands::{
 };
 pub use crate::search::slash_command_menu::{SlashCommandId, StaticCommand};
 pub use crate::server::server_api::ServerApiProvider;
+#[cfg(feature = "voice_input")]
+pub use crate::server::server_api::TranscribeError;
 pub use crate::server::server_api::ai::{
     AIClient, AgentConfigSnapshot, SpawnAgentRequest, SpawnAgentResponse,
 };
@@ -210,6 +219,9 @@ pub use crate::util::image::{
 };
 pub use crate::util::repo_detection::{RepoDetectionSessionType, detect_possible_git_repo};
 pub use crate::util::time_format::format_elapsed_seconds;
+#[cfg(feature = "voice_input")]
+pub use crate::voice::transcriber::{Transcriber, VoiceTranscriber};
+pub use crate::workspaces::user_workspaces::UserWorkspaces;
 
 /// Builds the live-shell completion context used to parse TUI input for NLD.
 pub fn tui_completion_session_context(

@@ -58,6 +58,7 @@ fn tui_supports_the_selected_low_effort_commands_but_not_cost_or_orchestrate() {
         (&commands::MCP, TuiSlashCommand::Mcp),
         (&commands::EXIT, TuiSlashCommand::Exit),
         (&commands::VIEW_LOGS, TuiSlashCommand::ViewLogs),
+        (&commands::VOICE, TuiSlashCommand::Voice),
     ] {
         assert_eq!(
             TuiSlashCommand::from_static_command(command),

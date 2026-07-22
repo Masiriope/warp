@@ -29,6 +29,45 @@ fn parsed_skill(argument: Option<&str>) -> ParsedSlashCommandInput {
 }
 
 #[test]
+fn slash_command_menu_renders_voice_row() {
+    App::test((), |mut app| async move {
+        app.update(|ctx| {
+            ctx.add_singleton_model(|_| Appearance::mock());
+            let input_editor = ctx.add_model(|ctx| CodeEditorModel::new_tui(80, ctx));
+            let suggestions_mode = ctx.add_model(|_| TuiInputSuggestionsModeModel::new());
+            suggestions_mode.update(ctx, |mode, ctx| {
+                mode.set_mode(TuiInputSuggestionsMode::SlashCommands, ctx);
+            });
+            let mixer = ctx.add_model(|_| SlashCommandMixer::new());
+            let model = ctx.add_model(|_| {
+                TuiSlashCommandModel::new_for_test(
+                    input_editor,
+                    suggestions_mode,
+                    mixer,
+                    vec![TuiSlashCommandRow {
+                        title: "/voice".to_owned(),
+                        description: Some("Start voice input".to_owned()),
+                        action: AcceptSlashCommandOrSavedPrompt::SlashCommand {
+                            id: SlashCommandId::new(),
+                        },
+                    }],
+                    0,
+                )
+            });
+            let menu = TuiInlineMenu::new(model);
+            let lines = render_menu_lines(
+                menu.render(ctx)
+                    .expect("voice slash command menu should render"),
+                ctx,
+            );
+
+            assert!(lines.iter().any(|line| line.contains("/voice")));
+            assert!(lines.iter().any(|line| line.contains("Start voice input")));
+        });
+    });
+}
+
+#[test]
 fn slash_command_menu_renders_view_logs_row() {
     App::test((), |mut app| async move {
         app.update(|ctx| {

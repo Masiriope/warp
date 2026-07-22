@@ -27,6 +27,7 @@ use super::{
     LOADING_CONVERSATION_HINT, SHELL_MODE_HINT, TuiConversationRestoreOrigin,
     TuiTerminalSessionAction, TuiTerminalSessionEvent, export_file_success_message,
     log_bundle_success_message, raw_prompt_if_not_blank, render_status_footer_row,
+    voice_argument_is_empty,
 };
 use crate::autoupdate::TuiAutoupdater;
 use crate::inline_menu::MAX_INLINE_MENU_ROWS;
@@ -51,6 +52,14 @@ use crate::usage::UsageToggle;
 struct FocusTestFixture {
     window_id: warpui_core::WindowId,
     sessions: ModelHandle<TuiSessions>,
+}
+
+#[test]
+fn voice_accepts_exact_and_whitespace_only_arguments() {
+    assert!(voice_argument_is_empty(None));
+    assert!(voice_argument_is_empty(Some(&String::new())));
+    assert!(voice_argument_is_empty(Some(&"   ".to_owned())));
+    assert!(!voice_argument_is_empty(Some(&"text".to_owned())));
 }
 
 #[test]
@@ -407,6 +416,36 @@ fn render_footer_lines(
             .finish();
         render_element(footer, ctx, width).to_lines()
     })
+}
+
+#[test]
+fn footer_renders_voice_listening_and_transcribing_states() {
+    App::test((), |mut app| async move {
+        let fixture = focus_test_fixture(&mut app);
+        let (view, _) = add_focus_test_session(&mut app, &fixture, true);
+
+        view.update(&mut app, |view, ctx| {
+            assert!(
+                view.voice_input_model
+                    .update(ctx, |voice, ctx| { voice.start(ctx) })
+            );
+        });
+        assert_eq!(
+            render_footer_lines(&mut app, &view, false, 80),
+            vec!["voice mode · esc to stop"]
+        );
+
+        view.update(&mut app, |view, ctx| {
+            assert!(
+                view.voice_input_model
+                    .update(ctx, |voice, ctx| { voice.stop(ctx) })
+            );
+        });
+        assert_eq!(
+            render_footer_lines(&mut app, &view, false, 80),
+            vec!["Transcribing..."]
+        );
+    });
 }
 
 /// A replacing hint occupies the whole status row, so no section separators,

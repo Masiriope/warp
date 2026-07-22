@@ -53,6 +53,7 @@ use crate::keybindings::{
 };
 use crate::transcript_view::TuiTranscriptView;
 use crate::tui_builder::TuiUiBuilder;
+use crate::voice_input::TuiVoiceInputModel;
 
 /// Keymap-context flag set while the input has contextual Escape behavior.
 ///
@@ -120,6 +121,8 @@ pub enum TuiInputViewEvent {
     AcceptedModel(LLMId),
     /// The user selected an action from the MCP menu.
     AcceptedMcp(TuiMcpAction),
+    /// Escape was consumed by a slash-originated voice session.
+    VoiceEscape,
     /// Shift+Up should move focus from the first visual row to the region above.
     MoveFocusUp,
 }
@@ -181,6 +184,8 @@ pub struct TuiInputView {
     can_move_focus_up: Rc<dyn Fn(&AppContext) -> bool>,
     /// Consults the owner live before an inline-menu Enter can accept an item.
     can_accept_inline_menu: Rc<dyn Fn(&AppContext) -> bool>,
+    /// Optional TUI-only voice controller. Isolated input tests leave it unset.
+    voice_input: Option<ModelHandle<TuiVoiceInputModel>>,
 }
 
 impl Entity for TuiInputView {
@@ -272,6 +277,7 @@ impl TuiInputView {
             keyboard_enhancement_supported: false,
             can_move_focus_up: Rc::new(can_move_focus_up),
             can_accept_inline_menu: Rc::new(|_| true),
+            voice_input: None,
         }
     }
 
@@ -280,6 +286,16 @@ impl TuiInputView {
         can_accept_inline_menu: impl Fn(&AppContext) -> bool + 'static,
     ) -> Self {
         self.can_accept_inline_menu = Rc::new(can_accept_inline_menu);
+        self
+    }
+
+    pub(crate) fn with_voice_input(
+        mut self,
+        voice_input: ModelHandle<TuiVoiceInputModel>,
+        ctx: &mut ViewContext<Self>,
+    ) -> Self {
+        ctx.subscribe_to_model(&voice_input, |_, _, _, ctx| ctx.notify());
+        self.voice_input = Some(voice_input);
         self
     }
 
@@ -301,6 +317,12 @@ impl TuiInputView {
         input_mode_policy::is_shell_mode(self.input_mode.as_ref(ctx))
     }
 
+    pub(crate) fn voice_is_active(&self, ctx: &AppContext) -> bool {
+        self.voice_input
+            .as_ref()
+            .is_some_and(|voice| voice.as_ref(ctx).is_active())
+    }
+
     /// Returns a handle to the backing [`CodeEditorModel`].
     pub fn model(&self) -> &ModelHandle<CodeEditorModel> {
         &self.model
@@ -320,6 +342,16 @@ impl TuiInputView {
         // viewport back to the top.
         self.follow_cursor(ctx);
         ctx.notify();
+    }
+
+    /// Inserts a completed voice transcription without submitting it.
+    pub(crate) fn insert_transcribed_text(&mut self, text: &str, ctx: &mut ViewContext<Self>) {
+        let text = self.editor_behavior.normalize_text(text);
+        if !text.is_empty() {
+            self.model.update(ctx, |m, ctx| m.user_insert(text, ctx));
+            self.follow_cursor(ctx);
+            ctx.notify();
+        }
     }
 
     /// Builds this frame's core editor element: editable, scroll-windowed, and
@@ -427,7 +459,7 @@ impl TuiView for TuiInputView {
     }
 
     fn render(&self, ctx: &AppContext) -> Box<dyn TuiElement> {
-        if self.is_shell_mode(ctx) {
+        if self.is_shell_mode(ctx) && !self.voice_is_active(ctx) {
             self.shell_element(ctx)
         } else {
             self.render_input(ctx)
@@ -436,7 +468,9 @@ impl TuiView for TuiInputView {
 
     fn keymap_context(&self, ctx: &AppContext) -> keymap::Context {
         input_keymap_context(
-            self.active_inline_menu(ctx).is_some() || self.is_shell_mode(ctx),
+            self.active_inline_menu(ctx).is_some()
+                || self.is_shell_mode(ctx)
+                || self.voice_is_active(ctx),
             self.plan_toggle_available(ctx),
             self.keyboard_enhancement_supported,
         )
@@ -766,6 +800,11 @@ impl TuiInputView {
         if let Some(inline_menu) = self.active_inline_menu(ctx) {
             inline_menu.dismiss(ctx);
             ctx.notify();
+            return true;
+        }
+
+        if self.voice_is_active(ctx) {
+            ctx.emit(TuiInputViewEvent::VoiceEscape);
             return true;
         }
 

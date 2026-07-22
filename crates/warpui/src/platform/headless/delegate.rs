@@ -182,7 +182,25 @@ impl platform::Delegate for AppDelegate {
     }
 
     fn microphone_access_state(&self) -> platform::MicrophoneAccessState {
-        platform::MicrophoneAccessState::Denied
+        // The headless delegate is used by `warp_tui`, not by the GUI
+        // delegates. On platforms where cpal is the permission/device probe,
+        // let the recorder perform that probe; an explicit environment
+        // override keeps CI and fixture runs deterministic. A headless
+        // process cannot query AVCaptureDevice authorization without
+        // a GUI permission flow, so fail deterministically rather than treating
+        // `NotDetermined` as authorized. The GUI delegate retains its existing
+        // macOS authorization semantics.
+        if std::env::var_os("WARP_TUI_MICROPHONE_DENIED").is_some() {
+            return platform::MicrophoneAccessState::Denied;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            platform::MicrophoneAccessState::Denied
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            platform::MicrophoneAccessState::Authorized
+        }
     }
 
     fn is_headless(&self) -> bool {
