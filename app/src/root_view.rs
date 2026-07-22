@@ -646,12 +646,17 @@ pub fn create_transferred_window(
     );
 
     let pane_group_id = transferred_tab.pane_group.id();
+    if let Some(source_workspace) = WorkspaceRegistry::as_ref(ctx).get(source_window_id, ctx) {
+        source_workspace.update(ctx, |workspace, ctx| {
+            workspace.release_task_terminal_launches_for_transfer(&transferred_tab.pane_group, ctx);
+        });
+    }
     ctx.transfer_view_tree_to_window(pane_group_id, source_window_id, new_window_id);
 
     match WorkspaceRegistry::as_ref(ctx).get(new_window_id, ctx) {
         Some(new_workspace) => {
             new_workspace.update(ctx, |workspace, ctx| {
-                workspace.adopt_transferred_pane_group(transferred_tab.pane_group.clone(), ctx);
+                workspace.adopt_transferred_pane_group(transferred_tab, ctx);
             });
         }
         _ => {

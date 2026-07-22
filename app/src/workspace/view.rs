@@ -888,6 +888,18 @@ struct TaskTerminalLaunchState {
     finished: bool,
 }
 
+/// Runtime data needed to continue supervising a queued terminal after its
+/// pane group is transferred to another Warp window. The task relationship is
+/// still held separately in `task_terminal_launches`; this only restores the
+/// destination's terminal-event subscription without inspecting a command.
+#[derive(Clone)]
+struct TaskTerminalLaunchDetails {
+    task_id: TaskId,
+    command: String,
+    workspace_path: PathBuf,
+    state: Arc<Mutex<TaskTerminalLaunchState>>,
+}
+
 fn task_terminal_is_active(state: &Arc<Mutex<TaskTerminalLaunchState>>) -> bool {
     state.lock().map(|state| !state.finished).unwrap_or(false)
 }
@@ -1014,6 +1026,11 @@ pub struct TransferredTab {
     pub right_panel_open: bool,
     pub is_right_panel_maximized: bool,
     pub draggable_state: DraggableState,
+    /// Explicit queued-task links owned by terminal panes in this tab. These
+    /// move with the pane group; a destination never infers them from a shell
+    /// command, title, or process.
+    pub task_terminal_launches: HashMap<TerminalPaneId, TaskId>,
+    task_terminal_launch_details: HashMap<TerminalPaneId, TaskTerminalLaunchDetails>,
 }
 #[cfg(not(target_family = "wasm"))]
 struct ThirdPartyLocalContinuationLaunch {
@@ -1104,6 +1121,10 @@ pub struct Workspace {
     /// Only terminal panes created from the task queue are listed here.
     /// It lets close handling avoid classifying any pre-existing session.
     task_terminal_launches: HashMap<TerminalPaneId, TaskId>,
+    /// Non-durable supervision data for the explicitly linked terminal panes.
+    /// It travels with a `TransferredTab` so the receiving workspace can
+    /// recreate the terminal event subscription.
+    task_terminal_launch_details: HashMap<TerminalPaneId, TaskTerminalLaunchDetails>,
     pending_session_config_replacement: Option<PendingSessionConfigReplacement>,
     /// When set, the guided onboarding tutorial will start after the session
     /// config modal is closed (submitted or dismissed).
@@ -2480,22 +2501,27 @@ impl Workspace {
             return;
         }
 
+        let state = Arc::new(Mutex::new(TaskTerminalLaunchState::default()));
+        let launch_details = TaskTerminalLaunchDetails {
+            task_id: task_id.clone(),
+            command: command.clone(),
+            workspace_path: workspace.path.clone(),
+            state: state.clone(),
+        };
         self.task_terminal_launches
             .insert(terminal_pane_id, task_id.clone());
+        self.task_terminal_launch_details
+            .insert(terminal_pane_id, launch_details.clone());
 
         // The launch opens a normal visible session, so put the sidebar back
         // on Sessions rather than leaving the user on a task action surface.
         self.vertical_tabs_panel.show_sessions();
         ctx.notify();
 
-        let state = Arc::new(Mutex::new(TaskTerminalLaunchState::default()));
         self.subscribe_to_task_terminal_launch(
             terminal_view.clone(),
-            task_id.clone(),
-            terminal_pane_id.clone(),
-            command.clone(),
-            workspace.path.clone(),
-            state.clone(),
+            terminal_pane_id,
+            launch_details,
             ctx,
         );
 
@@ -2525,22 +2551,25 @@ impl Workspace {
             self.task_terminal_launches
                 .iter()
                 .find_map(|(terminal_pane_id, linked_task_id)| {
-                    (linked_task_id == task_id).then(|| terminal_pane_id.clone())
+                    (linked_task_id == task_id).then_some(*terminal_pane_id)
                 })
         else {
             ctx.notify();
             return;
         };
 
-        let tab_index = self.tabs.iter().position(|tab| {
+        let pane_locator = self.tabs.iter().find_map(|tab| {
             tab.pane_group
                 .as_ref(ctx)
                 .terminal_pane_ids()
-                .filter_map(|pane_id| pane_id.as_terminal_pane_id())
-                .any(|pane_id| pane_id == terminal_pane_id)
+                .find(|pane_id| pane_id.as_terminal_pane_id() == Some(terminal_pane_id))
+                .map(|pane_id| PaneViewLocator {
+                    pane_group_id: tab.pane_group.id(),
+                    pane_id,
+                })
         });
-        if let Some(tab_index) = tab_index {
-            self.activate_tab(tab_index, ctx);
+        if let Some(pane_locator) = pane_locator {
+            self.focus_pane(pane_locator, ctx);
         } else {
             // A stale link must not cause us to inspect or adopt a manual
             // terminal. Close and exit paths will recover the task state.
@@ -2559,6 +2588,8 @@ impl Workspace {
                 // the session to the ordinary Warp list on the next render.
                 self.task_terminal_launches
                     .retain(|_, linked_task_id| linked_task_id != task_id);
+                self.task_terminal_launch_details
+                    .retain(|_, launch| &launch.task_id != task_id);
                 ctx.notify();
             }
             Err(error) => self.show_task_launch_error(
@@ -2607,13 +2638,16 @@ impl Workspace {
     fn subscribe_to_task_terminal_launch(
         &mut self,
         terminal_view: ViewHandle<TerminalView>,
-        task_id: TaskId,
         terminal_pane_id: TerminalPaneId,
-        command: String,
-        workspace_path: PathBuf,
-        state: Arc<Mutex<TaskTerminalLaunchState>>,
+        launch: TaskTerminalLaunchDetails,
         ctx: &mut ViewContext<Self>,
     ) {
+        let TaskTerminalLaunchDetails {
+            task_id,
+            command,
+            workspace_path,
+            state,
+        } = launch;
         ctx.subscribe_to_view(&terminal_view, move |workspace, terminal, event, ctx| {
             if !workspace
                 .task_terminal_launches
@@ -2751,6 +2785,7 @@ impl Workspace {
         match result {
             Ok(_) => {
                 self.task_terminal_launches.remove(&terminal_pane_id);
+                self.task_terminal_launch_details.remove(&terminal_pane_id);
                 true
             }
             Err(error) => {
@@ -2772,6 +2807,7 @@ impl Workspace {
     ) -> bool {
         if self.require_task_launch_attention(task_id, reason, ctx) {
             self.task_terminal_launches.remove(&terminal_pane_id);
+            self.task_terminal_launch_details.remove(&terminal_pane_id);
             true
         } else {
             false
@@ -3956,6 +3992,7 @@ impl Workspace {
             session_config_modal,
             task_dialog,
             task_terminal_launches: HashMap::new(),
+            task_terminal_launch_details: HashMap::new(),
             pending_session_config_replacement: None,
             pending_onboarding_intention: None,
             pending_session_config_tab_config_chip: false,
@@ -28368,6 +28405,29 @@ impl Workspace {
     fn tab_transfer_info_at_index(&self, index: usize, ctx: &AppContext) -> Option<TransferredTab> {
         let tab = self.tabs.get(index)?;
         let pane_group = tab.pane_group.clone();
+        let terminal_pane_ids = pane_group
+            .as_ref(ctx)
+            .terminal_pane_ids()
+            .filter_map(|pane_id| pane_id.as_terminal_pane_id())
+            .collect_vec();
+        let task_terminal_launches = terminal_pane_ids
+            .iter()
+            .filter_map(|pane_id| {
+                self.task_terminal_launches
+                    .get(pane_id)
+                    .cloned()
+                    .map(|task_id| (*pane_id, task_id))
+            })
+            .collect();
+        let task_terminal_launch_details = terminal_pane_ids
+            .iter()
+            .filter_map(|pane_id| {
+                self.task_terminal_launch_details
+                    .get(pane_id)
+                    .cloned()
+                    .map(|launch| (*pane_id, launch))
+            })
+            .collect();
         let color = tab.color();
         let draggable_state = tab.draggable_state.clone();
         let custom_title = pane_group.read(ctx, |pg, ctx| pg.custom_title(ctx));
@@ -28387,6 +28447,8 @@ impl Workspace {
             draggable_state,
             vertical_tabs_panel_open,
             vertical_sidebar_mode,
+            task_terminal_launches,
+            task_terminal_launch_details,
         })
     }
 
@@ -28415,8 +28477,44 @@ impl Workspace {
         pane_group: &ViewHandle<PaneGroup>,
         ctx: &mut ViewContext<Self>,
     ) {
+        self.release_task_terminal_launches_for_transfer(pane_group, ctx);
         self.set_suppress_detach_panes_on_window_close(true);
         ctx.unsubscribe_to_view(pane_group);
+    }
+
+    /// Removes this workspace's ownership of task-terminal links before a
+    /// pane group changes windows. The `TransferredTab` already carries the
+    /// matching explicit links, so the receiving workspace can install them
+    /// together with fresh event subscriptions. No terminal is classified or
+    /// adopted by its command line here.
+    pub(crate) fn release_task_terminal_launches_for_transfer(
+        &mut self,
+        pane_group: &ViewHandle<PaneGroup>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let launches = pane_group
+            .as_ref(ctx)
+            .terminal_pane_ids()
+            .filter_map(|pane_id| {
+                let terminal_pane_id = pane_id.as_terminal_pane_id()?;
+                self.task_terminal_launches
+                    .contains_key(&terminal_pane_id)
+                    .then(|| {
+                        let terminal_view = pane_group
+                            .as_ref(ctx)
+                            .terminal_view_from_pane_id(pane_id, ctx);
+                        (terminal_pane_id, terminal_view)
+                    })
+            })
+            .collect_vec();
+
+        for (terminal_pane_id, terminal_view) in launches {
+            self.task_terminal_launches.remove(&terminal_pane_id);
+            self.task_terminal_launch_details.remove(&terminal_pane_id);
+            if let Some(terminal_view) = terminal_view {
+                ctx.unsubscribe_to_view(&terminal_view);
+            }
+        }
     }
 
     /// Suppresses pane-detach and closes this window with
@@ -28438,6 +28536,8 @@ impl Workspace {
             pane_group,
             color,
             draggable_state,
+            task_terminal_launches,
+            task_terminal_launch_details,
             ..
         } = transferred_tab;
         ctx.subscribe_to_view(&pane_group, move |me, pane_group, event, ctx| {
@@ -28450,12 +28550,76 @@ impl Workspace {
         // Never split a group: a drop that resolves to the middle of a group's
         // run is pushed past the group's last member instead.
         let index = self.clamp_past_group(index);
-        let mut tab_data = TabData::new(pane_group);
+        let mut tab_data = TabData::new(pane_group.clone());
         tab_data.selected_color = color.map_or(SelectedTabColor::Unset, SelectedTabColor::Color);
         tab_data.draggable_state = draggable_state;
         self.tabs.insert(index, tab_data);
+        self.adopt_transferred_task_terminal_launches(
+            &pane_group,
+            task_terminal_launches,
+            task_terminal_launch_details,
+            ctx,
+        );
         self.activate_tab_internal(index, ctx);
         ctx.notify();
+    }
+
+    fn adopt_transferred_task_terminal_launches(
+        &mut self,
+        pane_group: &ViewHandle<PaneGroup>,
+        task_terminal_launches: HashMap<TerminalPaneId, TaskId>,
+        mut task_terminal_launch_details: HashMap<TerminalPaneId, TaskTerminalLaunchDetails>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        for (terminal_pane_id, task_id) in task_terminal_launches {
+            let Some(launch) = task_terminal_launch_details.remove(&terminal_pane_id) else {
+                log::warn!(
+                    "task queue: transferred terminal {terminal_pane_id:?} is missing supervision data"
+                );
+                continue;
+            };
+            let Some(terminal_view) = pane_group
+                .as_ref(ctx)
+                .terminal_view_from_pane_id(terminal_pane_id, ctx)
+            else {
+                log::warn!(
+                    "task queue: transferred terminal {terminal_pane_id:?} is no longer available"
+                );
+                continue;
+            };
+            if launch.task_id != task_id {
+                log::warn!(
+                    "task queue: transferred terminal {terminal_pane_id:?} has mismatched task ownership"
+                );
+                continue;
+            }
+
+            self.task_terminal_launches
+                .insert(terminal_pane_id, task_id);
+            self.task_terminal_launch_details
+                .insert(terminal_pane_id, launch.clone());
+            self.subscribe_to_task_terminal_launch(
+                terminal_view.clone(),
+                terminal_pane_id,
+                launch.clone(),
+                ctx,
+            );
+
+            if let Some(shell_type) =
+                terminal_view.read(ctx, |terminal, ctx| terminal.active_session_shell_type(ctx))
+            {
+                self.start_task_terminal_command(
+                    &terminal_view,
+                    terminal_pane_id,
+                    &launch.task_id,
+                    &launch.command,
+                    &launch.workspace_path,
+                    shell_type,
+                    &launch.state,
+                    ctx,
+                );
+            }
+        }
     }
 
     /// If an insertion at `index` would land strictly inside a group's
@@ -28665,7 +28829,7 @@ impl Workspace {
     /// the source window, detaching and dropping the placeholder.
     pub fn adopt_transferred_pane_group(
         &mut self,
-        new_pane_group: ViewHandle<PaneGroup>,
+        transferred_tab: TransferredTab,
         ctx: &mut ViewContext<Self>,
     ) {
         if !self.pending_pane_group_transfer {
@@ -28680,6 +28844,12 @@ impl Workspace {
             debug_assert!(false, "adopt_transferred_pane_group called with no tabs");
             return;
         }
+        let TransferredTab {
+            pane_group: new_pane_group,
+            task_terminal_launches,
+            task_terminal_launch_details,
+            ..
+        } = transferred_tab;
         let Some(placeholder_tab) = self.tabs.last_mut() else {
             debug_assert!(
                 false,
@@ -28711,6 +28881,13 @@ impl Workspace {
         ctx.subscribe_to_view(&new_pane_group, move |me, pane_group, event, ctx| {
             me.handle_file_tree_event(pane_group, event, ctx)
         });
+
+        self.adopt_transferred_task_terminal_launches(
+            &new_pane_group,
+            task_terminal_launches,
+            task_terminal_launch_details,
+            ctx,
+        );
 
         let working_directories_model = self.working_directories_model.clone();
         placeholder_pane_group.update(ctx, |pg, ctx| {

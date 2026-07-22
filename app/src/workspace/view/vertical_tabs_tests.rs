@@ -13,10 +13,10 @@ use super::{
     coalesce_summary_branch_entries, code_detail_kind_label, compact_branch_subtitle_display,
     detail_sidecar_width_and_bounds, detail_target_for_hovered_row,
     non_terminal_search_text_fragments, pane_ids_for_display_granularity,
-    pane_search_text_fragments, preferred_agent_tab_titles, push_normalized_unique_summary_label,
-    search_fragments_contain_query, select_summary_pane_kind_icons,
-    should_keep_detail_sidecar_visible_for_mouse_position, should_show_tab_group_header,
-    sort_summary_primary_labels_status_first, summary_overflow_count,
+    pane_search_text_fragments, partition_visible_panes, preferred_agent_tab_titles,
+    push_normalized_unique_summary_label, search_fragments_contain_query,
+    select_summary_pane_kind_icons, should_keep_detail_sidecar_visible_for_mouse_position,
+    should_show_tab_group_header, sort_summary_primary_labels_status_first, summary_overflow_count,
     summary_search_text_fragments, terminal_kind_badge_label, terminal_primary_line_data,
     terminal_pull_request_badge_label, terminal_search_text_fragments,
     terminal_title_fallback_font, uses_outer_group_container, visible_pane_ids_for_detail_target,
@@ -75,6 +75,40 @@ fn task_panel_selection_is_isolated_between_vertical_sidebar_states() {
         Some(&second_workspace)
     );
     assert_eq!(second_selection.selected_task_id(), Some(&second_task));
+}
+
+#[test]
+fn task_pane_partition_keeps_the_manual_split_pane_in_normal_sessions() {
+    let task_pane = TerminalPaneId::dummy_terminal_pane_id();
+    let manual_pane = TerminalPaneId::dummy_terminal_pane_id();
+    let task_id = TaskId::new("LOCAL-042");
+
+    let (ordinary, linked) = partition_visible_panes(
+        vec![(7usize, vec![task_pane.into(), manual_pane.into()])],
+        |pane_id| (pane_id == PaneId::from(task_pane)).then_some(task_id.clone()),
+    );
+
+    assert_eq!(ordinary, vec![(7, vec![PaneId::from(manual_pane)])]);
+    assert_eq!(linked.len(), 1);
+    assert_eq!(linked[0].session, (7, PaneId::from(task_pane)));
+    assert_eq!(linked[0].task_id, Some(task_id));
+}
+
+#[test]
+fn task_pane_partition_only_groups_panes_that_survived_search_filtering() {
+    let task_pane = TerminalPaneId::dummy_terminal_pane_id();
+    let task_id = TaskId::new("LOCAL-043");
+
+    // This is the same input render_groups receives after a search matched
+    // only the explicit task terminal; a manual split pane never reappears.
+    let (ordinary, linked) =
+        partition_visible_panes(vec![(3usize, vec![task_pane.into()])], |pane_id| {
+            (pane_id == PaneId::from(task_pane)).then_some(task_id.clone())
+        });
+
+    assert!(ordinary.is_empty());
+    assert_eq!(linked.len(), 1);
+    assert_eq!(linked[0].session, (3, PaneId::from(task_pane)));
 }
 
 #[test]

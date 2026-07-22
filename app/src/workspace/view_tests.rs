@@ -537,25 +537,44 @@ fn opening_a_linked_task_session_focuses_only_the_explicit_task_terminal() {
         let task = queue_task_for_workspace(&mut app, &store, project.path());
         let workspace = mock_workspace(&mut app);
 
-        let linked_tab_index = workspace.update(&mut app, |workspace, ctx| {
-            workspace.handle_action(
-                &WorkspaceAction::LaunchTask {
-                    task_id: task.id.clone(),
-                    agent: AgentKind::Codex,
-                },
-                ctx,
-            );
-            workspace.active_tab_index()
-        });
+        let (linked_tab_index, task_terminal_pane_id) =
+            workspace.update(&mut app, |workspace, ctx| {
+                workspace.handle_action(
+                    &WorkspaceAction::LaunchTask {
+                        task_id: task.id.clone(),
+                        agent: AgentKind::Codex,
+                    },
+                    ctx,
+                );
+                (
+                    workspace.active_tab_index(),
+                    workspace
+                        .active_tab_pane_group()
+                        .as_ref(ctx)
+                        .active_session_id(ctx)
+                        .expect("task terminal should have a pane id"),
+                )
+            });
 
         workspace.update(&mut app, |workspace, ctx| {
-            workspace.add_terminal_tab(false, ctx);
-            assert_ne!(workspace.active_tab_index(), linked_tab_index);
+            let task_pane_group = workspace.active_tab_pane_group().clone();
+            let manual_terminal_pane_id = task_pane_group.update(ctx, |pane_group, ctx| {
+                pane_group.add_terminal_pane(Direction::Right, None, ctx)
+            });
+            assert_eq!(workspace.active_tab_index(), linked_tab_index);
+            assert_eq!(
+                task_pane_group.as_ref(ctx).focused_pane_id(ctx),
+                manual_terminal_pane_id.into()
+            );
             workspace.handle_action(
                 &WorkspaceAction::OpenLinkedTaskSession(task.id.clone()),
                 ctx,
             );
             assert_eq!(workspace.active_tab_index(), linked_tab_index);
+            assert_eq!(
+                task_pane_group.as_ref(ctx).focused_pane_id(ctx),
+                task_terminal_pane_id.into()
+            );
         });
     });
 }
@@ -609,6 +628,99 @@ fn marking_a_task_done_removes_only_its_explicit_session_link() {
             );
         });
         assert_eq!(task_from_queue(&app, &task.id).status, TaskStatus::Done);
+    });
+}
+
+#[test]
+fn transferring_a_linked_task_terminal_moves_ownership_and_completion_subscription() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        let source = mock_workspace(&mut app);
+
+        source.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+        });
+        let terminal = active_terminal(&source, &app);
+        terminal.update(&mut app, |_terminal, ctx| {
+            ctx.emit(crate::terminal::Event::ShellSpawned(
+                crate::terminal::shell::ShellType::Zsh,
+            ));
+        });
+
+        // Exercise the single-tab handoff as well. There is then only the
+        // linked terminal to transfer from the source workspace.
+        source.update(&mut app, |workspace, ctx| {
+            workspace.remove_tab_without_undo(0, ctx);
+            assert_eq!(workspace.tab_count(), 1);
+        });
+
+        let target = mock_workspace(&mut app);
+        let source_window_id = source.read(&app, |workspace, _| workspace.window_id);
+        let target_window_id = target.read(&app, |workspace, _| workspace.window_id);
+        let (transferred_tab, source_task_tab_index) = source.update(&mut app, |workspace, ctx| {
+            let source_task_tab_index = workspace.active_tab_index();
+            let transferred_tab = workspace
+                .get_tab_transfer_info_for_attach(source_task_tab_index, ctx)
+                .expect("linked task tab should be transferable");
+            workspace.prepare_for_transferred_tab_attach(&transferred_tab.pane_group, ctx);
+            (transferred_tab, source_task_tab_index)
+        });
+        let transferred_pane_group_id = transferred_tab.pane_group.id();
+        app.update(|ctx| {
+            ctx.transfer_view_tree_to_window(
+                transferred_pane_group_id,
+                source_window_id,
+                target_window_id,
+            );
+        });
+        target.update(&mut app, |workspace, ctx| {
+            workspace.insert_transferred_tab_at_index(transferred_tab, workspace.tab_count(), ctx);
+        });
+        source.update(&mut app, |workspace, ctx| {
+            workspace.remove_tab_without_undo(source_task_tab_index, ctx);
+            // A workspace keeps an empty replacement tab rather than becoming
+            // tabless, but it must not retain either task ownership map.
+            assert_eq!(workspace.tab_count(), 1);
+            assert!(workspace.task_terminal_launches.is_empty());
+            assert!(workspace.task_terminal_launch_details.is_empty());
+        });
+        target.read(&app, |workspace, _| {
+            assert!(
+                workspace
+                    .task_terminal_launches
+                    .values()
+                    .any(|task_id| task_id == &task.id)
+            );
+            assert!(
+                workspace
+                    .task_terminal_launch_details
+                    .values()
+                    .any(|launch| launch.task_id == task.id)
+            );
+        });
+
+        terminal.update(&mut app, |_terminal, ctx| {
+            ctx.emit(crate::terminal::Event::PendingCommandCompleted { success: true });
+        });
+
+        assert_eq!(
+            task_from_queue(&app, &task.id).status,
+            TaskStatus::ReviewRequired
+        );
+        target.read(&app, |workspace, _| {
+            assert!(workspace.task_terminal_launches.is_empty());
+            assert!(workspace.task_terminal_launch_details.is_empty());
+        });
     });
 }
 

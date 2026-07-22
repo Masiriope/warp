@@ -939,6 +939,15 @@ enum VerticalTabsResolvedMode {
     Summary,
 }
 
+#[derive(Clone)]
+struct TaskSessionReference {
+    tab_index: usize,
+    filtered_pane_ids: Option<Vec<PaneId>>,
+}
+
+type PaneTaskSession<T> = TaskSessionRow<(T, PaneId)>;
+type PaneTaskPartition<T> = (Vec<(T, Vec<PaneId>)>, Vec<PaneTaskSession<T>>);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SummaryPaneKind {
     Terminal,
@@ -2051,25 +2060,92 @@ fn render_groups(
         }
     }
 
-    let (visible_tabs, active_task_sessions) = task_session_group(
-        visible_tabs
+    let (visible_tabs, active_task_sessions) = if resolved_mode == VerticalTabsResolvedMode::Panes {
+        // In pane mode a split can contain one queued task terminal and one
+        // ordinary terminal. Partitioning at tab level would hide the latter,
+        // so preserve each visible pane as its own session row. The input
+        // already contains only query matches when search is active.
+        let visible_panes = visible_tabs
             .into_iter()
             .map(|(tab_index, filtered_pane_ids)| {
-                let task_id = workspace
-                    .tabs
-                    .get(tab_index)
-                    .and_then(|tab| task_id_for_tab(workspace, tab, app));
-                TaskSessionRow {
-                    session: (tab_index, filtered_pane_ids),
-                    task_id,
-                }
+                let tab = &workspace.tabs[tab_index];
+                let pane_ids = filtered_pane_ids
+                    .unwrap_or_else(|| tab.pane_group.as_ref(app).visible_pane_ids());
+                (tab_index, pane_ids)
+            });
+        let (ordinary_panes, linked_task_panes) =
+            partition_visible_panes(visible_panes, |pane_id| {
+                task_id_for_pane(workspace, pane_id)
+                    .filter(|task_id| TaskQueueModel::as_ref(app).task(task_id).is_some())
+            });
+        let (stale_task_panes, active_task_sessions) = task_session_group(
+            linked_task_panes.into_iter().map(|row| TaskSessionRow {
+                session: TaskSessionReference {
+                    tab_index: row.session.0,
+                    filtered_pane_ids: Some(vec![row.session.1]),
+                },
+                task_id: row.task_id,
             }),
-        |task_id| {
-            TaskQueueModel::as_ref(app)
-                .task(task_id)
-                .map(TaskSessionMetadata::from)
-        },
-    );
+            |task_id| {
+                TaskQueueModel::as_ref(app)
+                    .task(task_id)
+                    .map(TaskSessionMetadata::from)
+            },
+        );
+        let mut visible_tabs: Vec<_> = ordinary_panes
+            .into_iter()
+            .map(|(tab_index, pane_ids)| (tab_index, Some(pane_ids)))
+            .collect();
+        // Metadata is read above in the same render pass, so this should only
+        // handle a task removed concurrently. Keep that pane ordinary rather
+        // than ever hiding it or inferring a relationship from its process.
+        for stale in stale_task_panes {
+            let pane_ids = stale.filtered_pane_ids.unwrap_or_default();
+            if let Some((_, visible_pane_ids)) = visible_tabs
+                .iter_mut()
+                .find(|(tab_index, _)| *tab_index == stale.tab_index)
+            {
+                visible_pane_ids
+                    .get_or_insert_with(Vec::new)
+                    .extend(pane_ids);
+            } else {
+                visible_tabs.push((stale.tab_index, Some(pane_ids)));
+            }
+        }
+        visible_tabs.sort_by_key(|(tab_index, _)| *tab_index);
+        (visible_tabs, active_task_sessions)
+    } else {
+        let (ordinary_sessions, active_task_sessions) = task_session_group(
+            visible_tabs
+                .into_iter()
+                .map(|(tab_index, filtered_pane_ids)| {
+                    let task_id = workspace
+                        .tabs
+                        .get(tab_index)
+                        .and_then(|tab| task_id_for_tab(workspace, tab, app))
+                        .filter(|task_id| TaskQueueModel::as_ref(app).task(task_id).is_some());
+                    TaskSessionRow {
+                        session: TaskSessionReference {
+                            tab_index,
+                            filtered_pane_ids,
+                        },
+                        task_id,
+                    }
+                }),
+            |task_id| {
+                TaskQueueModel::as_ref(app)
+                    .task(task_id)
+                    .map(TaskSessionMetadata::from)
+            },
+        );
+        (
+            ordinary_sessions
+                .into_iter()
+                .map(|session| (session.tab_index, session.filtered_pane_ids))
+                .collect(),
+            active_task_sessions,
+        )
+    };
 
     let is_any_pane_dragging = any_workspace_pane_being_dragged(workspace, app);
     // Ghost state for cross-window drag hovering over this window's vertical tabs panel.
@@ -2085,11 +2161,26 @@ fn render_groups(
     if let Some(task_sessions) = active_task_sessions {
         groups.add_child(render_session_section_heading("Tareas en curso", app));
         for task_session in task_sessions.rows {
-            let (tab_index, _) = task_session.session;
+            let TaskSessionReference {
+                tab_index,
+                filtered_pane_ids,
+            } = task_session.session;
+            let position_id = filtered_pane_ids
+                .as_deref()
+                .and_then(|pane_ids| (pane_ids.len() == 1).then_some(pane_ids[0]))
+                .map_or_else(
+                    || tab_position_id(tab_index),
+                    |pane_id| {
+                        vtab_pane_row_position_id(
+                            workspace.tabs[tab_index].pane_group.id(),
+                            pane_id,
+                        )
+                    },
+                );
             groups.add_child(
                 SavePosition::new(
                     render_linked_task_session_row(&task_session.metadata, app),
-                    &tab_position_id(tab_index),
+                    &position_id,
                 )
                 .finish(),
             );
@@ -2210,6 +2301,45 @@ fn render_groups(
 /// A task-session relationship is only valid while the current workspace owns
 /// the explicit `TerminalPaneId -> TaskId` entry created by a queue launch.
 /// We deliberately do not inspect the terminal title, command or process.
+fn partition_visible_panes<T>(
+    visible_panes: impl IntoIterator<Item = (T, Vec<PaneId>)>,
+    task_for_pane: impl Fn(PaneId) -> Option<TaskId>,
+) -> PaneTaskPartition<T>
+where
+    T: Clone,
+{
+    let mut ordinary = Vec::new();
+    let mut linked = Vec::new();
+
+    for (tab, pane_ids) in visible_panes {
+        let mut ordinary_pane_ids = Vec::new();
+        for pane_id in pane_ids {
+            if let Some(task_id) = task_for_pane(pane_id) {
+                linked.push(TaskSessionRow {
+                    session: (tab.clone(), pane_id),
+                    task_id: Some(task_id),
+                });
+            } else {
+                ordinary_pane_ids.push(pane_id);
+            }
+        }
+        if !ordinary_pane_ids.is_empty() {
+            ordinary.push((tab, ordinary_pane_ids));
+        }
+    }
+
+    (ordinary, linked)
+}
+
+fn task_id_for_pane(workspace: &Workspace, pane_id: PaneId) -> Option<TaskId> {
+    pane_id.as_terminal_pane_id().and_then(|terminal_pane_id| {
+        workspace
+            .task_terminal_launches
+            .get(&terminal_pane_id)
+            .cloned()
+    })
+}
+
 fn task_id_for_tab(workspace: &Workspace, tab: &TabData, app: &AppContext) -> Option<TaskId> {
     tab.pane_group
         .as_ref(app)
@@ -2248,9 +2378,11 @@ fn render_linked_task_session_row(
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
     let task_id = metadata.task_id.clone();
-    let workspace_suffix = (!metadata.workspace_name.is_empty())
-        .then(|| format!(" · {}", metadata.workspace_name))
-        .unwrap_or_default();
+    let workspace_suffix = if metadata.workspace_name.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", metadata.workspace_name)
+    };
     let detail = format!(
         "{} · {} · {}{}",
         metadata.task_id.0, metadata.priority_label, metadata.status_label, workspace_suffix
@@ -2282,13 +2414,13 @@ fn render_linked_task_session_row(
                             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
                             .with_spacing(2.)
                             .with_child(
-                                Text::new_inline(title.clone(), font_family.clone(), 12.)
+                                Text::new_inline(title.clone(), font_family, 12.)
                                     .with_clip(ClipConfig::ellipsis())
                                     .with_color(theme.main_text_color(theme.background()).into())
                                     .finish(),
                             )
                             .with_child(
-                                Text::new_inline(detail.clone(), font_family.clone(), 11.)
+                                Text::new_inline(detail.clone(), font_family, 11.)
                                     .with_clip(ClipConfig::ellipsis())
                                     .with_color(theme.sub_text_color(theme.background()).into())
                                     .finish(),
