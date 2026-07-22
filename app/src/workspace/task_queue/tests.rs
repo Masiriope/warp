@@ -9,7 +9,7 @@ use std::os::unix::ffi::OsStringExt;
 use super::{
     AgentKind, NewTaskInput, Task, TaskAttachment, TaskId, TaskPriority, TaskQueueError,
     TaskQueueModel, TaskStatus, TaskStore, TaskWorkspace, WorkspaceId, WorkspaceRoot,
-    WorkspaceSource, default_sources,
+    WorkspaceSource, build_launch_command, default_sources, shell_quote,
 };
 
 fn stored_workspace(root: &Path) -> TaskWorkspace {
@@ -795,4 +795,61 @@ fn task_queue_keeps_tasks_and_selection_in_memory() {
 fn agent_kinds_map_to_the_expected_wrappers() {
     assert_eq!(AgentKind::Codex.wrapper_name(), "codexauto");
     assert_eq!(AgentKind::ClaudeCode.wrapper_name(), "claudeauto");
+}
+
+#[test]
+fn codex_launch_command_uses_the_task_markdown_path_in_the_spanish_prompt() {
+    let command = build_launch_command(
+        AgentKind::Codex,
+        Path::new("/tmp/task queue/LOCAL-004/task.md"),
+    )
+    .expect("absolute paths should build a launch command");
+
+    assert_eq!(
+        command,
+        "codexauto 'Lee y ejecuta la tarea en /tmp/task queue/LOCAL-004/task.md, incluidos sus adjuntos.'"
+    );
+}
+
+#[test]
+fn claude_code_launch_command_uses_the_task_markdown_path_in_the_spanish_prompt() {
+    let command = build_launch_command(
+        AgentKind::ClaudeCode,
+        Path::new("/tmp/task queue/LOCAL-004/task.md"),
+    )
+    .expect("absolute paths should build a launch command");
+
+    assert_eq!(
+        command,
+        "claudeauto 'Lee y ejecuta la tarea en /tmp/task queue/LOCAL-004/task.md, incluidos sus adjuntos.'"
+    );
+}
+
+#[test]
+fn shell_quote_uses_posix_single_quote_escaping() {
+    assert_eq!(
+        shell_quote("/tmp/O'Reilly/task.md"),
+        "'/tmp/O'\\''Reilly/task.md'"
+    );
+}
+
+#[test]
+fn launch_command_keeps_newline_and_shell_metacharacters_in_one_quoted_prompt_argument() {
+    let task_path = Path::new("/tmp/task.md\n; touch /tmp/should-not-run");
+    let command = build_launch_command(AgentKind::Codex, task_path)
+        .expect("absolute paths should build a launch command");
+
+    assert_eq!(
+        command,
+        "codexauto 'Lee y ejecuta la tarea en /tmp/task.md\n; touch /tmp/should-not-run, incluidos sus adjuntos.'"
+    );
+    assert_eq!(command.matches('\'').count(), 2);
+}
+
+#[test]
+fn launch_command_rejects_relative_task_markdown_paths() {
+    let error = build_launch_command(AgentKind::Codex, Path::new("task.md"))
+        .expect_err("relative task paths must not produce a launch command");
+
+    assert!(error.to_string().contains("absolute"));
 }

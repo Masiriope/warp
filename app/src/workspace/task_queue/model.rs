@@ -396,6 +396,8 @@ pub(crate) enum TaskQueueError {
     WorkspaceNotFound(WorkspaceId),
     #[error("task {0:?} is not in the queue")]
     TaskNotFound(TaskId),
+    #[error("task Markdown path must be absolute: {0}")]
+    RelativeTaskMarkdownPath(PathBuf),
 }
 
 #[derive(Default)]

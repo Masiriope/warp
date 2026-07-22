@@ -1,6 +1,8 @@
+mod command;
 mod model;
 mod storage;
 
+pub(crate) use command::{build_launch_command, shell_quote};
 pub(crate) use model::{
     AgentKind, DiscoveredWorkspace, NewTaskInput, Task, TaskAttachment, TaskId, TaskPriority,
     TaskQueueError, TaskQueueModel, TaskStatus, TaskWorkspace, WorkspaceId, WorkspaceRoot,
