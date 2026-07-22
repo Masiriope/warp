@@ -190,6 +190,92 @@ fn malformed_markdown_reports_an_inspectable_load_error_without_hiding_valid_tas
 }
 
 #[test]
+fn malformed_task_ids_parent_paths_and_duplicate_attachments_are_reported_individually() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+    let valid = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("valid task should persist");
+    let unsafe_id = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("unsafe-id fixture should persist first");
+    let duplicate_attachments = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("duplicate-attachment fixture should persist first");
+
+    let unsafe_id_path = store
+        .task_directory(&unsafe_id.workspace_id, &unsafe_id.id)
+        .join("task.md");
+    let unsafe_id_markdown = fs::read_to_string(&unsafe_id_path)
+        .expect("unsafe-id fixture markdown should be readable")
+        .replacen(
+            &format!("id: \"{}\"", unsafe_id.id.0),
+            "id: \"unsafe/task\"",
+            1,
+        );
+    fs::write(&unsafe_id_path, unsafe_id_markdown).expect("unsafe-id markdown should be written");
+
+    let duplicate_path = store
+        .task_directory(
+            &duplicate_attachments.workspace_id,
+            &duplicate_attachments.id,
+        )
+        .join("task.md");
+    let duplicate_markdown = fs::read_to_string(&duplicate_path)
+        .expect("duplicate fixture markdown should be readable")
+        .replacen(
+            "attachments:\n",
+            "attachments:\n  - \"attachments/duplicate.txt\"\n  - \"attachments/duplicate.txt\"\n",
+            1,
+        );
+    fs::write(&duplicate_path, duplicate_markdown)
+        .expect("duplicate attachment markdown should be written");
+
+    let mismatched_path = data
+        .path()
+        .join("TaskQueue/v1/tasks/other-workspace/other-task/task.md");
+    fs::create_dir_all(
+        mismatched_path
+            .parent()
+            .expect("task path should have a parent"),
+    )
+    .expect("mismatched task directory should be created");
+    fs::copy(
+        store
+            .task_directory(&valid.workspace_id, &valid.id)
+            .join("task.md"),
+        &mismatched_path,
+    )
+    .expect("valid markdown should be copied to mismatched location");
+
+    let loaded = store
+        .list()
+        .expect("task list should continue after errors");
+
+    assert_eq!(loaded.tasks, vec![valid]);
+    assert_eq!(loaded.errors.len(), 3);
+    assert!(
+        loaded
+            .errors
+            .iter()
+            .any(|error| error.reason.contains("unsafe task storage path component"))
+    );
+    assert!(
+        loaded
+            .errors
+            .iter()
+            .any(|error| error.reason.contains("does not match its parent directory"))
+    );
+    assert!(
+        loaded
+            .errors
+            .iter()
+            .any(|error| error.reason.contains("duplicate attachment filename"))
+    );
+}
+
+#[test]
 fn missing_workspace_path_loads_task_as_attention_required_without_deleting_it() {
     let data = tempfile::tempdir().expect("data directory should be created");
     let workspace = tempfile::tempdir().expect("workspace should be created");
@@ -284,6 +370,73 @@ fn model_uses_discovered_workspace_metadata_when_persisting_an_input_by_id() {
         store.list().expect("task list should load").tasks,
         vec![task]
     );
+}
+
+#[test]
+fn model_rejects_an_unavailable_workspace_before_persisting_any_task_data() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let unavailable = data.path().join("unavailable-workspace");
+    let mut model = TaskQueueModel::from_roots(vec![WorkspaceRoot::new(
+        WorkspaceSource::Github,
+        unavailable,
+    )]);
+    let workspace_id = model.workspaces()[0].id.clone();
+    let store = TaskStore::open(data.path());
+
+    let error = model
+        .create_with_store(
+            &store,
+            NewTaskInput::new(workspace_id.clone(), "Do not persist"),
+        )
+        .expect_err("unavailable workspace should fail before persistence");
+
+    assert!(error.to_string().contains("workspace path is unavailable"));
+    assert!(model.tasks_for_workspace(&workspace_id).is_empty());
+    assert!(
+        store
+            .list()
+            .expect("task list should load")
+            .tasks
+            .is_empty()
+    );
+    assert!(!store.root().join("tasks").exists());
+    assert!(!store.root().join("workspaces.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_workspace_paths_are_rejected_before_storage_is_created() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace_name = OsString::from_vec(b"workspace-\x80".to_vec());
+    let workspace_path = data.path().join(workspace_name);
+    let store = TaskStore::open(data.path());
+
+    let error = store
+        .create(
+            NewTaskInput::new(WorkspaceId::new("non-utf8-workspace"), "Do not persist")
+                .with_workspace(TaskWorkspace::new(
+                    WorkspaceId::new("non-utf8-workspace"),
+                    WorkspaceSource::Github,
+                    workspace_path,
+                    "non-utf8 workspace",
+                )),
+        )
+        .expect_err("non-UTF8 workspace paths should fail before staging");
+
+    assert!(
+        error
+            .to_string()
+            .contains("workspace path is not valid UTF-8 for task storage")
+    );
+    assert!(
+        store
+            .list()
+            .expect("task list should load")
+            .tasks
+            .is_empty()
+    );
+    assert!(!store.root().join("tasks").exists());
+    assert!(!store.root().join("workspaces.json").exists());
 }
 
 #[test]

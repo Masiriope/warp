@@ -113,6 +113,7 @@ flate2 = "1.0.17"
 float-cmp.workspace = true
 futures-lite.workspace = true
 futures-util.workspace = true
+fs4.workspace = true
 futures.workspace = true
 fuzzy_match.workspace = true
 getset.workspace = true

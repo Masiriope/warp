@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 
+use fs4::fs_std::FileExt;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -55,6 +56,10 @@ pub(crate) enum TaskStoreError {
     WorkspaceMetadataMissing,
     #[error("workspace metadata does not match task workspace ID")]
     WorkspaceMetadataMismatch,
+    #[error("workspace path is unavailable: {path}")]
+    WorkspacePathUnavailable { path: PathBuf },
+    #[error("workspace path is not valid UTF-8 for task storage: {path:?}")]
+    WorkspacePathNotUtf8 { path: PathBuf },
     #[error("unsafe task storage path component {0:?}")]
     UnsafePathComponent(String),
     #[error("unsafe attachment filename {0:?}")]
@@ -106,6 +111,16 @@ impl TaskStore {
             return Err(TaskStoreError::WorkspaceMetadataMismatch);
         }
         validate_path_component(&workspace.id.0)?;
+        if workspace.path.to_str().is_none() {
+            return Err(TaskStoreError::WorkspacePathNotUtf8 {
+                path: workspace.path,
+            });
+        }
+        if !workspace.path.is_dir() {
+            return Err(TaskStoreError::WorkspacePathUnavailable {
+                path: workspace.path,
+            });
+        }
 
         self.create_directory(&self.root)?;
         let staging_root = self.root.join(STAGING_DIRECTORY);
@@ -217,6 +232,7 @@ impl TaskStore {
             source,
         })?;
         let mut task = parse_task_markdown(task_file, &contents)?;
+        validate_task_location(task_file, &task)?;
         if task
             .workspace
             .as_ref()
@@ -233,6 +249,7 @@ impl TaskStore {
     }
 
     fn upsert_workspace(&self, workspace: &TaskWorkspace) -> Result<(), TaskStoreError> {
+        let _lock = WorkspaceIndexLock::acquire(&self.root)?;
         let index = self.root.join(WORKSPACES_FILE);
         let mut workspaces = if index.exists() {
             let contents = fs::read(&index).map_err(|source| TaskStoreError::Io {
@@ -263,15 +280,19 @@ impl TaskStore {
     }
 
     fn write_atomic_file(&self, path: &Path, bytes: &[u8]) -> Result<(), TaskStoreError> {
-        let temporary = path.with_file_name(format!("{WORKSPACES_FILE}.tmp"));
-        self.write_file(&temporary, bytes)?;
-
-        replace_file_without_removing_destination(&temporary, path, replace_existing_file)
-            .map_err(|source| TaskStoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        Ok(())
+        let temporary = path.with_file_name(format!("{WORKSPACES_FILE}.{}.tmp", Uuid::new_v4()));
+        let result = (|| {
+            self.write_file(&temporary, bytes)?;
+            replace_file_without_removing_destination(&temporary, path, replace_existing_file)
+                .map_err(|source| TaskStoreError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
 
     fn write_file(&self, path: &Path, bytes: &[u8]) -> Result<(), TaskStoreError> {
@@ -326,6 +347,41 @@ impl TaskStore {
 
     fn tasks_root(&self) -> PathBuf {
         self.root.join(TASKS_DIRECTORY)
+    }
+}
+
+/// A process-wide lock scoped to one task-store root. It serializes the
+/// workspace-index read/modify/write transaction without coordinating
+/// unrelated stores elsewhere on disk.
+struct WorkspaceIndexLock {
+    file: File,
+}
+
+impl WorkspaceIndexLock {
+    fn acquire(root: &Path) -> Result<Self, TaskStoreError> {
+        fs::create_dir_all(root).map_err(|source| TaskStoreError::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let path = root.join(format!("{WORKSPACES_FILE}.lock"));
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| TaskStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.lock_exclusive()
+            .map_err(|source| TaskStoreError::Io { path, source })?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for WorkspaceIndexLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -397,6 +453,7 @@ fn parse_task_markdown(path: &Path, contents: &str) -> Result<Task, TaskStoreErr
         return Err(invalid(path, "schema_version must be 1"));
     }
     let workspace_id = WorkspaceId::new(required_string(path, &fields, "workspace_id")?);
+    validate_path_component(&workspace_id.0)?;
     let workspace_source =
         WorkspaceSource::from_storage_name(&required_string(path, &fields, "workspace_source")?)
             .ok_or_else(|| invalid(path, "workspace_source is not supported"))?;
@@ -406,14 +463,22 @@ fn parse_task_markdown(path: &Path, contents: &str) -> Result<Task, TaskStoreErr
         required_string(path, &fields, "workspace_path")?,
         required_string(path, &fields, "workspace_display_name")?,
     );
+    let task_id = TaskId::new(required_string(path, &fields, "id")?);
+    validate_path_component(&task_id.0)?;
+    let mut attachment_references = HashSet::new();
     let mut attachments = Vec::new();
     for attachment in &fields.attachments {
         validate_attachment_reference(attachment)
             .map_err(|error| invalid(path, &error.to_string()))?;
+        if !attachment_references.insert(attachment.clone()) {
+            return Err(TaskStoreError::DuplicateAttachmentFilename(
+                attachment.clone(),
+            ));
+        }
         attachments.push(TaskAttachment::new(attachment.clone()));
     }
     Ok(Task {
-        id: TaskId::new(required_string(path, &fields, "id")?),
+        id: task_id,
         workspace_id,
         workspace: Some(workspace),
         title: required_string(path, &fields, "title")?,
@@ -660,6 +725,35 @@ fn validate_attachment_reference(value: &str) -> Result<(), TaskStoreError> {
     validate_attachment_filename(filename)
 }
 
+fn validate_task_location(task_file: &Path, task: &Task) -> Result<(), TaskStoreError> {
+    let task_directory = task_file
+        .parent()
+        .ok_or_else(|| invalid(task_file, "task file has no task directory"))?;
+    let workspace_directory = task_directory
+        .parent()
+        .ok_or_else(|| invalid(task_file, "task file has no workspace directory"))?;
+    let stored_task_id = task_directory
+        .file_name()
+        .ok_or_else(|| invalid(task_file, "task directory has no name"))?;
+    let stored_workspace_id = workspace_directory
+        .file_name()
+        .ok_or_else(|| invalid(task_file, "workspace directory has no name"))?;
+
+    if stored_task_id != task.id.0.as_str() {
+        return Err(invalid(
+            task_file,
+            "task ID does not match its parent directory",
+        ));
+    }
+    if stored_workspace_id != task.workspace_id.0.as_str() {
+        return Err(invalid(
+            task_file,
+            "workspace ID does not match its parent directory",
+        ));
+    }
+    Ok(())
+}
+
 fn push_string_field(markdown: &mut String, key: &str, value: &str) {
     markdown.push_str(key);
     markdown.push_str(": ");
@@ -737,6 +831,7 @@ fn null_terminated_wide(path: &Path) -> Vec<u16> {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+    use std::thread;
 
     #[test]
     fn index_replacement_failure_keeps_the_existing_destination_readable() {
@@ -768,5 +863,90 @@ mod storage_tests {
             fs::read(&temporary).expect("temporary index should remain available for cleanup"),
             b"replacement index"
         );
+    }
+
+    #[test]
+    fn workspace_index_lock_serializes_two_task_store_updates() {
+        let data = tempfile::tempdir().expect("data directory should be created");
+        let first_workspace_path = data.path().join("first-workspace");
+        let second_workspace_path = data.path().join("second-workspace");
+        fs::create_dir_all(&first_workspace_path).expect("first workspace should be created");
+        fs::create_dir_all(&second_workspace_path).expect("second workspace should be created");
+        let first_store = TaskStore::open(data.path());
+        let second_store = first_store.clone();
+        let index_store = first_store.clone();
+        let index_lock = WorkspaceIndexLock::acquire(first_store.root())
+            .expect("test should acquire the workspace index lock");
+
+        let first = thread::spawn(move || {
+            first_store.create(
+                NewTaskInput::new(WorkspaceId::new("first-workspace"), "First task")
+                    .with_workspace(TaskWorkspace::new(
+                        WorkspaceId::new("first-workspace"),
+                        WorkspaceSource::Github,
+                        first_workspace_path,
+                        "First workspace",
+                    )),
+            )
+        });
+        let second = thread::spawn(move || {
+            second_store.create(
+                NewTaskInput::new(WorkspaceId::new("second-workspace"), "Second task")
+                    .with_workspace(TaskWorkspace::new(
+                        WorkspaceId::new("second-workspace"),
+                        WorkspaceSource::Github,
+                        second_workspace_path,
+                        "Second workspace",
+                    )),
+            )
+        });
+
+        drop(index_lock);
+        first
+            .join()
+            .expect("first writer should not panic")
+            .expect("first writer should persist");
+        second
+            .join()
+            .expect("second writer should not panic")
+            .expect("second writer should persist");
+
+        let workspaces = serde_json::from_slice::<Vec<TaskWorkspace>>(
+            &fs::read(index_store.root().join(WORKSPACES_FILE))
+                .expect("workspace index should be readable"),
+        )
+        .expect("workspace index should be valid JSON");
+        assert_eq!(
+            workspaces
+                .iter()
+                .map(|workspace| workspace.id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first-workspace", "second-workspace"]
+        );
+    }
+
+    #[test]
+    fn failed_index_replacement_cleans_only_its_own_unique_temporary_file() {
+        let data = tempfile::tempdir().expect("data directory should be created");
+        let store = TaskStore::open(data.path());
+        fs::create_dir_all(store.root()).expect("store root should be created");
+        let unrelated_temporary = store.root().join("workspaces.json.unrelated.tmp");
+        fs::write(&unrelated_temporary, b"another writer").expect("unrelated temp should exist");
+        let destination = store.root().join("index-is-a-directory");
+        fs::create_dir(&destination).expect("replacement destination should be a directory");
+
+        assert!(
+            store
+                .write_atomic_file(&destination, b"replacement")
+                .is_err()
+        );
+
+        let remaining_temporary_files = fs::read_dir(store.root())
+            .expect("store root should be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.to_string_lossy().ends_with(".tmp"))
+            .collect::<Vec<_>>();
+        assert_eq!(remaining_temporary_files, vec![unrelated_temporary]);
     }
 }
