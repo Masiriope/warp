@@ -54,6 +54,9 @@ app/src/persistence/schema.rs.orig
 # Don't include Claude Code worktrees
 .claude/worktrees/
 
+# Don't include isolated local development worktrees.
+.worktrees/
+
 # Don't include Claude Code scheduled task lock
 .claude/scheduled_tasks.lock
 
