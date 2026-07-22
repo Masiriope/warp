@@ -722,7 +722,11 @@ fn validate_attachment_reference(value: &str) -> Result<(), TaskStoreError> {
     let filename = filename
         .to_str()
         .ok_or_else(|| TaskStoreError::UnsafeAttachmentFilename(value.into()))?;
-    validate_attachment_filename(filename)
+    validate_attachment_filename(filename)?;
+    if value != format!("{ATTACHMENTS_DIRECTORY}/{filename}") {
+        return Err(TaskStoreError::UnsafeAttachmentFilename(value.into()));
+    }
+    Ok(())
 }
 
 fn validate_task_location(task_file: &Path, task: &Task) -> Result<(), TaskStoreError> {

@@ -203,6 +203,9 @@ fn malformed_task_ids_parent_paths_and_duplicate_attachments_are_reported_indivi
     let duplicate_attachments = store
         .create(stored_task_input(stored_workspace(workspace.path())))
         .expect("duplicate-attachment fixture should persist first");
+    let noncanonical_attachments = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("noncanonical-attachment fixture should persist first");
 
     let unsafe_id_path = store
         .task_directory(&unsafe_id.workspace_id, &unsafe_id.id)
@@ -232,6 +235,22 @@ fn malformed_task_ids_parent_paths_and_duplicate_attachments_are_reported_indivi
     fs::write(&duplicate_path, duplicate_markdown)
         .expect("duplicate attachment markdown should be written");
 
+    let noncanonical_path = store
+        .task_directory(
+            &noncanonical_attachments.workspace_id,
+            &noncanonical_attachments.id,
+        )
+        .join("task.md");
+    let noncanonical_markdown = fs::read_to_string(&noncanonical_path)
+        .expect("noncanonical fixture markdown should be readable")
+        .replacen(
+            "attachments:\n",
+            "attachments:\n  - \"attachments/duplicate.txt\"\n  - \"attachments/./duplicate.txt\"\n",
+            1,
+        );
+    fs::write(&noncanonical_path, noncanonical_markdown)
+        .expect("noncanonical attachment markdown should be written");
+
     let mismatched_path = data
         .path()
         .join("TaskQueue/v1/tasks/other-workspace/other-task/task.md");
@@ -254,7 +273,7 @@ fn malformed_task_ids_parent_paths_and_duplicate_attachments_are_reported_indivi
         .expect("task list should continue after errors");
 
     assert_eq!(loaded.tasks, vec![valid]);
-    assert_eq!(loaded.errors.len(), 3);
+    assert_eq!(loaded.errors.len(), 4);
     assert!(
         loaded
             .errors
@@ -272,6 +291,12 @@ fn malformed_task_ids_parent_paths_and_duplicate_attachments_are_reported_indivi
             .errors
             .iter()
             .any(|error| error.reason.contains("duplicate attachment filename"))
+    );
+    assert!(
+        loaded
+            .errors
+            .iter()
+            .any(|error| error.reason.contains("unsafe attachment filename"))
     );
 }
 
