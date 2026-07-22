@@ -3,6 +3,9 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -263,20 +266,11 @@ impl TaskStore {
         let temporary = path.with_file_name(format!("{WORKSPACES_FILE}.tmp"));
         self.write_file(&temporary, bytes)?;
 
-        // POSIX rename atomically replaces an existing file. Windows does not
-        // replace an existing destination with `std::fs::rename`, so remove
-        // the old index only after the durable temporary file is ready.
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path).map_err(|source| TaskStoreError::Io {
+        replace_file_without_removing_destination(&temporary, path, replace_existing_file)
+            .map_err(|source| TaskStoreError::Io {
                 path: path.to_path_buf(),
                 source,
             })?;
-        }
-        fs::rename(&temporary, path).map_err(|source| TaskStoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
         Ok(())
     }
 
@@ -693,5 +687,86 @@ fn invalid(path: &Path, reason: impl Into<String>) -> TaskStoreError {
     TaskStoreError::Invalid {
         path: path.to_path_buf(),
         reason: reason.into(),
+    }
+}
+
+/// Replaces a durable file without deleting its current destination first.
+/// This keeps readers from observing a missing index if the platform replace
+/// operation fails.
+fn replace_file_without_removing_destination(
+    temporary: &Path,
+    destination: &Path,
+    replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    replace(temporary, destination)
+}
+
+#[cfg(not(windows))]
+fn replace_existing_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    // POSIX rename atomically replaces an existing file on the same filesystem.
+    fs::rename(temporary, destination)
+}
+
+#[cfg(windows)]
+fn replace_existing_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    use windows::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    use windows::core::PCWSTR;
+
+    let temporary = null_terminated_wide(temporary);
+    let destination = null_terminated_wide(destination);
+    // The staging file is in the same directory as the index. MoveFileExW
+    // therefore performs a same-volume replacement, and WRITE_THROUGH asks
+    // Windows to flush the move before returning.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temporary.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(io::Error::other)
+}
+
+#[cfg(windows)]
+fn null_terminated_wide(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn index_replacement_failure_keeps_the_existing_destination_readable() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let destination = directory.path().join(WORKSPACES_FILE);
+        let temporary = directory.path().join(format!("{WORKSPACES_FILE}.tmp"));
+        fs::write(&destination, b"previous index").expect("previous index should be written");
+        fs::write(&temporary, b"replacement index").expect("replacement index should be written");
+
+        let result = replace_file_without_removing_destination(
+            &temporary,
+            &destination,
+            |temporary, destination| {
+                assert_eq!(
+                    fs::read(destination).expect("destination should remain readable"),
+                    b"previous index"
+                );
+                assert!(temporary.exists());
+                Err(io::Error::other("simulated replacement failure"))
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&destination).expect("previous index should remain readable"),
+            b"previous index"
+        );
+        assert_eq!(
+            fs::read(&temporary).expect("temporary index should remain available for cleanup"),
+            b"replacement index"
+        );
     }
 }
