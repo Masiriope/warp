@@ -8,14 +8,15 @@ use warpui::elements::PositionedElementOffsetBounds;
 use super::{
     AgentTabTextPreference, SummaryPaneKind, SummaryPaneKindIcons, TerminalAgentText,
     TerminalPrimaryLineData, TerminalPrimaryLineFont, VerticalTabsDetailTarget,
-    VerticalTabsDetailTargetKind, VerticalTabsSummaryBranchEntry, VerticalTabsSummaryData,
-    VerticalTabsSummaryPrimaryLabel, branch_label_display, coalesce_summary_branch_entries,
-    code_detail_kind_label, compact_branch_subtitle_display, detail_sidecar_width_and_bounds,
-    detail_target_for_hovered_row, non_terminal_search_text_fragments,
-    pane_ids_for_display_granularity, pane_search_text_fragments, preferred_agent_tab_titles,
-    push_normalized_unique_summary_label, search_fragments_contain_query,
-    select_summary_pane_kind_icons, should_keep_detail_sidecar_visible_for_mouse_position,
-    should_show_tab_group_header, sort_summary_primary_labels_status_first, summary_overflow_count,
+    VerticalTabsDetailTargetKind, VerticalTabsPanelState, VerticalTabsSummaryBranchEntry,
+    VerticalTabsSummaryData, VerticalTabsSummaryPrimaryLabel, branch_label_display,
+    coalesce_summary_branch_entries, code_detail_kind_label, compact_branch_subtitle_display,
+    detail_sidecar_width_and_bounds, detail_target_for_hovered_row,
+    non_terminal_search_text_fragments, pane_ids_for_display_granularity,
+    pane_search_text_fragments, preferred_agent_tab_titles, push_normalized_unique_summary_label,
+    search_fragments_contain_query, select_summary_pane_kind_icons,
+    should_keep_detail_sidecar_visible_for_mouse_position, should_show_tab_group_header,
+    sort_summary_primary_labels_status_first, summary_overflow_count,
     summary_search_text_fragments, terminal_kind_badge_label, terminal_primary_line_data,
     terminal_pull_request_badge_label, terminal_search_text_fragments,
     terminal_title_fallback_font, uses_outer_group_container, visible_pane_ids_for_detail_target,
@@ -28,6 +29,7 @@ use crate::pane_group::{PaneId, TerminalPaneId};
 use crate::safe_triangle::SafeTriangle;
 use crate::terminal::CLIAgent;
 use crate::workspace::tab_settings::VerticalTabsDisplayGranularity;
+use crate::workspace::task_queue::{TaskId, WorkspaceId};
 
 fn label(text: &str) -> VerticalTabsSummaryPrimaryLabel {
     VerticalTabsSummaryPrimaryLabel {
@@ -43,6 +45,36 @@ fn code_summary_kind(title: &str) -> SummaryPaneKind {
     SummaryPaneKind::Code {
         title: title.to_string(),
     }
+}
+
+#[test]
+fn task_panel_selection_is_isolated_between_vertical_sidebar_states() {
+    let first_workspace = WorkspaceId::new("first-workspace");
+    let first_task = TaskId::new("first-task");
+    let second_workspace = WorkspaceId::new("second-workspace");
+    let second_task = TaskId::new("second-task");
+    let mut first = VerticalTabsPanelState::default();
+    let mut second = VerticalTabsPanelState::default();
+
+    first.select_task_in_workspace(first_workspace.clone(), first_task.clone());
+    second.select_task_in_workspace(second_workspace.clone(), second_task.clone());
+
+    let first_selection = first.task_panel_selection();
+    let first_selection = first_selection.lock().expect("first selection should lock");
+    let second_selection = second.task_panel_selection();
+    let second_selection = second_selection
+        .lock()
+        .expect("second selection should lock");
+    assert_eq!(
+        first_selection.selected_workspace_id(),
+        Some(&first_workspace)
+    );
+    assert_eq!(first_selection.selected_task_id(), Some(&first_task));
+    assert_eq!(
+        second_selection.selected_workspace_id(),
+        Some(&second_workspace)
+    );
+    assert_eq!(second_selection.selected_task_id(), Some(&second_task));
 }
 
 #[test]

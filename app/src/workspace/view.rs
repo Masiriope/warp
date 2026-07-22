@@ -120,9 +120,9 @@ use warpui::{
 use self::vertical_tabs::telemetry::{VerticalTabsDisplayOption, VerticalTabsTelemetryEvent};
 use self::vertical_tabs::{
     SummaryPaneKind, SummaryPaneKindIcons, VERTICAL_TABS_SETTINGS_BUTTON_POSITION_ID,
-    VerticalTabsPanelState, htab_group_position_id, pane_summary_kind, render_detail_sidecar,
-    render_settings_popup, render_summary_pane_kind_icons, show_before_indicator,
-    vtab_group_position_id,
+    VerticalSidebarMode, VerticalTabsPanelState, htab_group_position_id, pane_summary_kind,
+    render_detail_sidecar, render_settings_popup, render_summary_pane_kind_icons,
+    show_before_indicator, vtab_group_position_id,
 };
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use super::action::AutoCloudHandoffTrigger;
@@ -2348,15 +2348,14 @@ impl Workspace {
         match event {
             TaskDialogEvent::Cancelled => self.close_task_dialog(ctx),
             TaskDialogEvent::Submitted(input) => {
-                let result = TaskQueueModel::handle(ctx).update(ctx, |queue, _| {
-                    let task = queue.create_in_active_store_and_select(input.clone());
-                    if task.is_ok() {
-                        let _ = queue.select_workspace(input.workspace_id.clone());
-                    }
-                    task
-                });
+                let result = TaskQueueModel::handle(ctx)
+                    .update(ctx, |queue, _| queue.create_in_active_store(input.clone()));
                 match result {
-                    Ok(_) => self.close_task_dialog(ctx),
+                    Ok(task) => {
+                        self.vertical_tabs_panel
+                            .select_task_in_workspace(input.workspace_id.clone(), task.id);
+                        self.close_task_dialog(ctx);
+                    }
                     Err(error) => {
                         self.toast_stack.update(ctx, |toast_stack, ctx| {
                             toast_stack.add_ephemeral_toast(
@@ -2533,7 +2532,7 @@ impl Workspace {
     pub(crate) fn open_task_dialog(&mut self, ctx: &mut ViewContext<Self>) {
         let queue = TaskQueueModel::as_ref(ctx);
         let workspaces = queue.workspaces().to_vec();
-        let selected_workspace_id = queue.selected_workspace_id().cloned();
+        let selected_workspace_id = self.vertical_tabs_panel.selected_task_workspace_id();
         self.task_dialog.view.update(ctx, |modal, ctx| {
             modal.body().update(ctx, |body, ctx| {
                 body.configure(workspaces, selected_workspace_id, ctx);
@@ -3982,6 +3981,13 @@ impl Workspace {
     ) {
         self.vertical_tabs_panel_open =
             Self::initial_vertical_tabs_panel_open(&workspace_setting, ctx);
+        let sidebar_mode = match &workspace_setting {
+            NewWorkspaceSource::Restored {
+                window_snapshot, ..
+            } => window_snapshot.vertical_sidebar_mode,
+            _ => VerticalSidebarMode::Sessions,
+        };
+        self.vertical_tabs_panel.set_sidebar_mode(sidebar_mode);
         match workspace_setting {
             NewWorkspaceSource::Empty {
                 previous_active_window,
@@ -11724,6 +11730,7 @@ impl Workspace {
             warp_drive_index_width,
             left_panel_open: self.left_panel_open,
             vertical_tabs_panel_open: self.vertical_tabs_panel_open,
+            vertical_sidebar_mode: self.vertical_tabs_panel.sidebar_mode(),
             left_panel_width,
             right_panel_width,
             agent_management_filters,
@@ -24075,13 +24082,6 @@ impl TypedActionView for Workspace {
             AddDockerSandboxTab => self.add_docker_sandbox_tab(ctx),
             ShowTaskQueue => {
                 self.vertical_tabs_panel.show_task_queue();
-                if let Some(workspace_id) = self
-                    .vertical_tabs_panel
-                    .take_pending_task_workspace_selection()
-                {
-                    let _ = TaskQueueModel::handle(ctx)
-                        .update(ctx, |queue, _| queue.select_workspace(workspace_id));
-                }
                 ctx.notify();
             }
             ShowSessions => {
@@ -24090,8 +24090,10 @@ impl TypedActionView for Workspace {
             }
             OpenTaskDialog => self.open_task_dialog(ctx),
             SelectTask(task_id) => {
-                let _ = TaskQueueModel::handle(ctx)
-                    .update(ctx, |queue, _| queue.select_task(task_id.clone()));
+                if let Some(task) = TaskQueueModel::as_ref(ctx).task(task_id) {
+                    self.vertical_tabs_panel
+                        .select_task_in_workspace(task.workspace_id.clone(), task_id.clone());
+                }
                 ctx.notify();
             }
             // Task 6 owns terminal creation and linked-session navigation.

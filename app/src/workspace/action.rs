@@ -1016,7 +1016,9 @@ impl WorkspaceAction {
             | OpenRepository { .. }
             | SelectTabConfig(_)
             | ToggleVerticalTabsPanel
-            | OpenVerticalTabsPanel => true, // actions that actually change a state of the state of user's
+            | OpenVerticalTabsPanel
+            | ShowTaskQueue
+            | ShowSessions => true, // actions that actually change a state of the state of user's
             // workspace would most likely require a save, so that if the app gets
             // restarted, the user can continue working
             AutoupdateFailureLink
@@ -1215,8 +1217,6 @@ impl WorkspaceAction {
             | ShowHandoffEnvironmentCreationModal
             | ShowCloudModeV2EnvironmentCreationModal
             | OpenCreateAuthSecretModal { .. }
-            | ShowTaskQueue
-            | ShowSessions
             | OpenTaskDialog
             | SelectTask(_)
             | LaunchTask { .. }

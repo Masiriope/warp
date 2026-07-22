@@ -17,6 +17,34 @@ use crate::workspace::action::WorkspaceAction;
 const TASK_ROW_RADIUS: f32 = 4.;
 const TASK_SECTION_GAP: f32 = 8.;
 
+/// Ephemeral selection state for one workspace window's Tasks sidebar.
+/// Durable tasks live in `TaskQueueModel`; never place window selection there.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TaskPanelSelection {
+    selected_workspace_id: Option<WorkspaceId>,
+    selected_task_id: Option<TaskId>,
+}
+
+impl TaskPanelSelection {
+    pub(crate) fn select_workspace(&mut self, workspace_id: WorkspaceId) {
+        self.selected_workspace_id = Some(workspace_id);
+        self.selected_task_id = None;
+    }
+
+    pub(crate) fn select_task_in_workspace(&mut self, workspace_id: WorkspaceId, task_id: TaskId) {
+        self.selected_workspace_id = Some(workspace_id);
+        self.selected_task_id = Some(task_id);
+    }
+
+    pub(crate) fn selected_workspace_id(&self) -> Option<&WorkspaceId> {
+        self.selected_workspace_id.as_ref()
+    }
+
+    pub(crate) fn selected_task_id(&self) -> Option<&TaskId> {
+        self.selected_task_id.as_ref()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TaskPresentation {
     pub(crate) priority_label: &'static str,
@@ -137,15 +165,19 @@ pub(crate) fn task_actions_for(task_id: TaskId) -> TaskPanelActions {
 }
 
 pub(crate) fn render_task_queue_panel(
-    pending_workspace_selection: Arc<Mutex<Option<WorkspaceId>>>,
+    selection: Arc<Mutex<TaskPanelSelection>>,
     search_query: &str,
     app: &AppContext,
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
     let queue = TaskQueueModel::as_ref(app);
-    let selected_workspace_id = queue.selected_workspace_id();
-    let selected_task_id = queue.selected_task_id();
+    let selection_snapshot = selection
+        .lock()
+        .map(|selection| selection.clone())
+        .unwrap_or_default();
+    let selected_workspace_id = selection_snapshot.selected_workspace_id();
+    let selected_task_id = selection_snapshot.selected_task_id();
 
     let mut content = Flex::column()
         .with_main_axis_size(MainAxisSize::Min)
@@ -155,7 +187,7 @@ pub(crate) fn render_task_queue_panel(
     content.add_child(render_workspace_selector(
         queue,
         selected_workspace_id,
-        pending_workspace_selection,
+        selection.clone(),
         app,
     ));
 
@@ -214,7 +246,10 @@ pub(crate) fn render_task_queue_panel(
         .and_then(|task_id| queue.task(task_id))
         .filter(|task| task.workspace_id == *selected_workspace_id)
     {
-        content.add_child(render_task_detail(task, app));
+        let workspace_is_available = queue
+            .workspace(selected_workspace_id)
+            .is_some_and(|workspace| workspace.is_available);
+        content.add_child(render_task_detail(task, workspace_is_available, app));
     }
 
     Container::new(content.finish())
@@ -226,7 +261,7 @@ pub(crate) fn render_task_queue_panel(
 fn render_workspace_selector(
     queue: &TaskQueueModel,
     selected_workspace_id: Option<&WorkspaceId>,
-    pending_workspace_selection: Arc<Mutex<Option<WorkspaceId>>>,
+    selection: Arc<Mutex<TaskPanelSelection>>,
     app: &AppContext,
 ) -> Box<dyn Element> {
     let mut sections = Flex::column()
@@ -250,7 +285,7 @@ fn render_workspace_selector(
                     workspace.display_name.clone(),
                     workspace.is_available,
                     selected_workspace_id == Some(&workspace.id),
-                    pending_workspace_selection.clone(),
+                    selection.clone(),
                     app,
                 ));
             }
@@ -265,7 +300,7 @@ fn render_workspace_row(
     display_name: String,
     is_available: bool,
     is_selected: bool,
-    pending_workspace_selection: Arc<Mutex<Option<WorkspaceId>>>,
+    selection: Arc<Mutex<TaskPanelSelection>>,
     app: &AppContext,
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
@@ -296,15 +331,11 @@ fn render_workspace_row(
     }
     .finish();
 
-    if !is_available {
-        return row;
-    }
-
     Hoverable::new(MouseStateHandle::default(), move |_| row)
         .with_cursor(Cursor::PointingHand)
         .on_click(move |ctx, _, _| {
-            if let Ok(mut selected_workspace) = pending_workspace_selection.lock() {
-                *selected_workspace = Some(workspace_id.clone());
+            if let Ok(mut task_selection) = selection.lock() {
+                task_selection.select_workspace(workspace_id.clone());
             }
             ctx.dispatch_typed_action(WorkspaceAction::ShowTaskQueue);
         })
@@ -354,7 +385,11 @@ fn render_task_row(task: &Task, is_selected: bool, app: &AppContext) -> Box<dyn 
         .finish()
 }
 
-fn render_task_detail(task: &Task, app: &AppContext) -> Box<dyn Element> {
+fn render_task_detail(
+    task: &Task,
+    workspace_is_available: bool,
+    app: &AppContext,
+) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
     let presentation = task_presentation(task.priority, task.status);
@@ -406,7 +441,13 @@ fn render_task_detail(task: &Task, app: &AppContext) -> Box<dyn Element> {
     buttons.add_child(
         Shrinkable::new(
             1.,
-            task_action_button("Abrir con Codex", actions.launch_codex, true, app),
+            task_action_button(
+                "Abrir con Codex",
+                actions.launch_codex,
+                true,
+                workspace_is_available,
+                app,
+            ),
         )
         .finish(),
     );
@@ -417,6 +458,7 @@ fn render_task_detail(task: &Task, app: &AppContext) -> Box<dyn Element> {
                 "Abrir con Claude Code",
                 actions.launch_claude_code,
                 false,
+                workspace_is_available,
                 app,
             ),
         )
@@ -429,6 +471,7 @@ fn render_task_detail(task: &Task, app: &AppContext) -> Box<dyn Element> {
             "Abrir sesión",
             actions.open_linked_session,
             false,
+            true,
             app,
         ));
     }
@@ -437,6 +480,7 @@ fn render_task_detail(task: &Task, app: &AppContext) -> Box<dyn Element> {
             "Marcar terminada",
             actions.mark_done,
             false,
+            true,
             app,
         ));
     }
@@ -453,11 +497,17 @@ fn task_action_button(
     label: &'static str,
     action: WorkspaceAction,
     is_primary: bool,
+    is_enabled: bool,
     app: &AppContext,
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
-    let (background, text_color) = if is_primary {
+    let (background, text_color) = if !is_enabled {
+        (
+            internal_colors::fg_overlay_2(theme),
+            theme.sub_text_color(theme.background()),
+        )
+    } else if is_primary {
         (theme.accent(), theme.background())
     } else {
         (
@@ -474,6 +524,9 @@ fn task_action_button(
     .with_background(background)
     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(TASK_ROW_RADIUS)))
     .finish();
+    if !is_enabled {
+        return button;
+    }
     Hoverable::new(MouseStateHandle::default(), move |_| button)
         .with_cursor(Cursor::PointingHand)
         .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))

@@ -24,6 +24,16 @@ use crate::workspace::WorkspaceRegistry;
 use crate::workspace::tab_group::TabGroupId;
 use crate::workspace::view::left_panel::ToolPanelView;
 
+/// The active body of a window's vertical sidebar. This value belongs to a
+/// window snapshot rather than the global task queue, so restoring one window
+/// cannot change the sidebar mode of another.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum VerticalSidebarMode {
+    #[default]
+    Sessions,
+    Tasks,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppState {
     pub windows: Vec<WindowSnapshot>,
@@ -54,6 +64,7 @@ pub struct WindowSnapshot {
     pub warp_drive_index_width: Option<f32>,
     pub left_panel_open: bool,
     pub vertical_tabs_panel_open: bool,
+    pub vertical_sidebar_mode: VerticalSidebarMode,
     pub left_panel_width: Option<f32>,
     pub right_panel_width: Option<f32>,
     pub agent_management_filters: Option<PersistedAgentManagementFilters>,

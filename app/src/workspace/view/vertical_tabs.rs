@@ -40,6 +40,7 @@ use crate::ai::agent::conversation::{ConversationStatus, StatusColorStyle};
 use crate::ai::agent_management::AgentNotificationsModel;
 use crate::ai::cloud_environments::CloudAmbientAgentEnvironment;
 use crate::ai::conversation_status_ui::render_status_element;
+pub(crate) use crate::app_state::VerticalSidebarMode;
 use crate::appearance::Appearance;
 use crate::cloud_object::CloudObjectLookup as _;
 use crate::cloud_object::model::generic_string_model::StringModel;
@@ -75,7 +76,9 @@ use crate::workspace::tab_settings::{
     TabSettings, VerticalTabsCompactSubtitle, VerticalTabsDisplayGranularity,
     VerticalTabsPrimaryInfo, VerticalTabsTabItemMode, VerticalTabsViewMode,
 };
-use crate::workspace::task_queue::{WorkspaceId, render_task_queue_panel};
+use crate::workspace::task_queue::{
+    TaskId, TaskPanelSelection, WorkspaceId, render_task_queue_panel,
+};
 use crate::workspace::view::vertical_tabs::telemetry::{
     VerticalTabsChipEntrypoint, VerticalTabsTelemetryEvent,
 };
@@ -713,7 +716,7 @@ pub(super) struct VerticalTabsPanelState {
     new_tab_button_state: MouseStateHandle,
     pub(super) search_query: String,
     sidebar_mode: VerticalSidebarMode,
-    pending_task_workspace_selection: Arc<Mutex<Option<WorkspaceId>>>,
+    task_panel_selection: Arc<Mutex<TaskPanelSelection>>,
     settings_button_mouse_state: MouseStateHandle,
     panes_segment_mouse_state: MouseStateHandle,
     tabs_segment_mouse_state: MouseStateHandle,
@@ -753,7 +756,7 @@ impl Default for VerticalTabsPanelState {
             new_tab_button_state: Default::default(),
             search_query: String::new(),
             sidebar_mode: VerticalSidebarMode::Sessions,
-            pending_task_workspace_selection: Arc::new(Mutex::new(None)),
+            task_panel_selection: Arc::new(Mutex::new(TaskPanelSelection::default())),
             settings_button_mouse_state: Default::default(),
             panes_segment_mouse_state: Default::default(),
             tabs_segment_mouse_state: Default::default(),
@@ -776,15 +779,6 @@ impl Default for VerticalTabsPanelState {
     }
 }
 
-/// Determines which body is displayed below the native vertical-tabs controls.
-/// Session rendering remains the default and keeps its existing data path.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum VerticalSidebarMode {
-    #[default]
-    Sessions,
-    Tasks,
-}
-
 impl VerticalTabsPanelState {
     pub(super) fn sidebar_mode(&self) -> VerticalSidebarMode {
         self.sidebar_mode
@@ -798,15 +792,25 @@ impl VerticalTabsPanelState {
         self.sidebar_mode = VerticalSidebarMode::Sessions;
     }
 
-    pub(super) fn pending_task_workspace_selection(&self) -> Arc<Mutex<Option<WorkspaceId>>> {
-        self.pending_task_workspace_selection.clone()
+    pub(super) fn set_sidebar_mode(&mut self, sidebar_mode: VerticalSidebarMode) {
+        self.sidebar_mode = sidebar_mode;
     }
 
-    pub(super) fn take_pending_task_workspace_selection(&self) -> Option<WorkspaceId> {
-        self.pending_task_workspace_selection
+    pub(super) fn task_panel_selection(&self) -> Arc<Mutex<TaskPanelSelection>> {
+        self.task_panel_selection.clone()
+    }
+
+    pub(super) fn select_task_in_workspace(&mut self, workspace_id: WorkspaceId, task_id: TaskId) {
+        if let Ok(mut selection) = self.task_panel_selection.lock() {
+            selection.select_task_in_workspace(workspace_id, task_id);
+        }
+    }
+
+    pub(super) fn selected_task_workspace_id(&self) -> Option<WorkspaceId> {
+        self.task_panel_selection
             .lock()
             .ok()
-            .and_then(|mut selection| selection.take())
+            .and_then(|selection| selection.selected_workspace_id().cloned())
     }
 
     /// Returns a lightweight handle bundle for workspace-level visibility reconciliation while the
@@ -1456,7 +1460,7 @@ fn render_control_bar(
     let settings_button = render_settings_button(state, appearance);
     let primary_button = match state.sidebar_mode() {
         VerticalSidebarMode::Sessions => render_new_tab_button(state, workspace, appearance, app),
-        VerticalSidebarMode::Tasks => render_new_task_button(state, appearance),
+        VerticalSidebarMode::Tasks => render_new_task_button(state, appearance, app),
     };
 
     Container::new(
@@ -1480,6 +1484,7 @@ fn render_control_bar(
 fn render_new_task_button(
     state: &VerticalTabsPanelState,
     appearance: &Appearance,
+    app: &AppContext,
 ) -> Box<dyn Element> {
     let theme = appearance.theme();
     let button = Container::new(
@@ -1491,6 +1496,18 @@ fn render_new_task_button(
     .with_background(internal_colors::fg_overlay_3(theme))
     .with_corner_radius(CornerRadius::with_all(CONTROL_BAR_BUTTON_RADIUS))
     .finish();
+
+    let workspace_is_available = state
+        .selected_task_workspace_id()
+        .map(|workspace_id| {
+            crate::workspace::task_queue::TaskQueueModel::as_ref(app)
+                .workspace(&workspace_id)
+                .is_some_and(|workspace| workspace.is_available)
+        })
+        .unwrap_or(true);
+    if !workspace_is_available {
+        return button;
+    }
 
     Hoverable::new(state.new_tab_button_state.clone(), move |_| button)
         .with_cursor(Cursor::PointingHand)
@@ -1778,11 +1795,9 @@ fn render_vertical_tabs_panel(
         .with_child(render_vertical_sidebar_mode_toggle(state, app))
         .with_child(match state.sidebar_mode() {
             VerticalSidebarMode::Sessions => render_groups(state, workspace, app),
-            VerticalSidebarMode::Tasks => render_task_queue_panel(
-                state.pending_task_workspace_selection(),
-                &state.search_query,
-                app,
-            ),
+            VerticalSidebarMode::Tasks => {
+                render_task_queue_panel(state.task_panel_selection(), &state.search_query, app)
+            }
         })
         .finish();
 

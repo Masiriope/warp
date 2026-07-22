@@ -483,6 +483,77 @@ fn model_can_load_persisted_tasks_without_coupling_storage_to_ui() {
 }
 
 #[test]
+fn model_initialization_loads_persisted_tasks_and_reconciles_workspace_metadata() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+    let task = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("task should persist");
+    let malformed = store.root().join("tasks/workspace-1/broken-task");
+    fs::create_dir_all(&malformed).expect("malformed task directory should be created");
+    fs::write(
+        malformed.join("task.md"),
+        "---\nstatus: pending\n---\nmissing fields",
+    )
+    .expect("malformed task should be written");
+
+    let model = TaskQueueModel::from_roots_and_store(Vec::new(), &store);
+
+    assert_eq!(model.task(&task.id), Some(&task));
+    assert_eq!(model.load_errors().len(), 1);
+    assert_eq!(model.load_errors()[0].path, malformed.join("task.md"));
+    assert!(model.store_load_error().is_none());
+    assert!(
+        model
+            .workspaces()
+            .iter()
+            .any(|workspace| workspace.id == task.workspace_id)
+    );
+}
+
+#[test]
+fn failed_startup_store_load_keeps_the_queue_usable_and_records_the_error() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let store = TaskStore::open(data.path());
+    fs::create_dir_all(store.root()).expect("store root should be created");
+    fs::write(store.root().join("tasks"), "not a directory")
+        .expect("invalid task root should be written");
+
+    let model = TaskQueueModel::from_roots_and_store(Vec::new(), &store);
+
+    assert!(model.workspaces().is_empty());
+    assert!(model.load_errors().is_empty());
+    assert!(model.store_load_error().is_some());
+}
+
+#[test]
+fn loaded_tasks_keep_removed_workspaces_selectable_and_inspectable() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let workspace_path = workspace.path().to_path_buf();
+    let store = TaskStore::open(data.path());
+    let task = store
+        .create(stored_task_input(stored_workspace(&workspace_path)))
+        .expect("task should persist");
+    fs::remove_dir_all(&workspace_path).expect("workspace should be removed");
+
+    let model = TaskQueueModel::from_roots_and_store(Vec::new(), &store);
+    let restored_workspace = model
+        .workspaces()
+        .iter()
+        .find(|workspace| workspace.id == task.workspace_id)
+        .expect("stored workspace metadata should remain visible");
+    let restored_task = model
+        .task(&task.id)
+        .expect("stored task should not be discarded");
+
+    assert!(!restored_workspace.is_available);
+    assert_eq!(restored_task.status, TaskStatus::AttentionRequired);
+    assert!(restored_task.attention_reason.is_some());
+}
+
+#[test]
 fn discovers_direct_child_workspaces_in_their_source_groups() {
     let home = tempfile::tempdir().expect("home directory should be created");
     let github = home.path().join("Documents/GitHub");
@@ -723,23 +794,6 @@ fn unavailable_workspace_roots_remain_visible() {
 }
 
 #[test]
-fn task_queue_selects_discovered_workspaces_in_memory() {
-    let root = tempfile::tempdir().expect("workspace root should be created");
-    let github = root.path().join("github");
-    fs::create_dir_all(github.join("MGA-Portal")).expect("workspace should be created");
-
-    let mut model = TaskQueueModel::new();
-    model.discover(vec![WorkspaceRoot::new(WorkspaceSource::Github, github)]);
-    let workspace_id = model.workspaces()[0].id.clone();
-
-    model
-        .select_workspace(workspace_id.clone())
-        .expect("discovered workspace should be selectable");
-
-    assert_eq!(model.selected_workspace_id(), Some(&workspace_id));
-}
-
-#[test]
 fn invalid_task_transitions_preserve_attention_reason() {
     let mut task = Task::new(
         TaskId::new("task-1"),
@@ -758,7 +812,7 @@ fn invalid_task_transitions_preserve_attention_reason() {
 }
 
 #[test]
-fn task_queue_keeps_tasks_and_selection_in_memory() {
+fn task_queue_keeps_tasks_in_memory_without_window_selection() {
     let workspace_id = super::WorkspaceId::new("workspace-1");
     let attachment = super::TaskAttachment::new("notes.md");
     let mut task = Task::new(
@@ -784,11 +838,6 @@ fn task_queue_keeps_tasks_and_selection_in_memory() {
         "Use the local Markdown task queue"
     );
     assert_eq!(model.tasks_for_workspace(&workspace_id).len(), 1);
-    model
-        .select_task(task_id.clone())
-        .expect("stored task should be selectable");
-    assert_eq!(model.selected_task_id(), Some(&task_id));
-    assert!(model.select_task(TaskId::new("missing-task")).is_err());
 }
 
 #[test]

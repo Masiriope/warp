@@ -410,6 +410,16 @@ impl DiscoveredWorkspace {
             is_available: false,
         }
     }
+
+    fn from_stored_workspace(workspace: &TaskWorkspace) -> Self {
+        Self {
+            id: workspace.id.clone(),
+            source: workspace.source,
+            path: workspace.path.clone(),
+            display_name: workspace.display_name.clone(),
+            is_available: workspace.path.is_dir(),
+        }
+    }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -421,10 +431,6 @@ pub(crate) enum TaskQueueError {
         action: &'static str,
         status: TaskStatus,
     },
-    #[error("workspace {0:?} is not discovered")]
-    WorkspaceNotFound(WorkspaceId),
-    #[error("task {0:?} is not in the queue")]
-    TaskNotFound(TaskId),
     #[error("task Markdown path must be absolute: {0}")]
     RelativeTaskMarkdownPath(PathBuf),
     #[error("task Markdown path must be named task.md: {0}")]
@@ -436,8 +442,8 @@ pub(crate) struct TaskQueueModel {
     sources: Vec<WorkspaceRoot>,
     workspaces: Vec<DiscoveredWorkspace>,
     tasks: HashMap<TaskId, Task>,
-    selected_workspace_id: Option<WorkspaceId>,
-    selected_task_id: Option<TaskId>,
+    load_errors: Vec<TaskLoadError>,
+    store_load_error: Option<String>,
     initialization_error: Option<TaskQueueError>,
 }
 
@@ -452,13 +458,29 @@ impl TaskQueueModel {
         model
     }
 
+    /// Builds the durable queue from live workspace discovery plus a caller
+    /// supplied store. Keeping this constructor injectable makes startup load
+    /// behavior testable without coupling tests to the active channel path.
+    pub(crate) fn from_roots_and_store(roots: Vec<WorkspaceRoot>, store: &TaskStore) -> Self {
+        let mut model = Self::from_roots(roots);
+        model.reload_from_store(store);
+        model
+    }
+
     pub(crate) fn from_home(home: Option<PathBuf>) -> Self {
         match home {
-            Some(home) => Self::from_roots(default_sources(home)),
-            None => Self {
-                initialization_error: Some(TaskQueueError::HomeDirectoryUnavailable),
-                ..Self::new()
-            },
+            Some(home) => Self::from_roots_and_store(
+                default_sources(home),
+                &TaskStore::open_in_active_channel_data_directory(),
+            ),
+            None => {
+                let mut model = Self {
+                    initialization_error: Some(TaskQueueError::HomeDirectoryUnavailable),
+                    ..Self::new()
+                };
+                model.reload_from_store(&TaskStore::open_in_active_channel_data_directory());
+                model
+            }
         }
     }
 
@@ -466,16 +488,23 @@ impl TaskQueueModel {
         self.initialization_error.as_ref()
     }
 
+    /// Individual malformed task files found during the last successful load.
+    /// Valid tasks remain available even when this collection is non-empty.
+    pub(crate) fn load_errors(&self) -> &[TaskLoadError] {
+        &self.load_errors
+    }
+
+    /// An I/O-level load failure never makes the global model unusable. The
+    /// message is retained for diagnostics while the discovered queue remains
+    /// available to the UI.
+    pub(crate) fn store_load_error(&self) -> Option<&str> {
+        self.store_load_error.as_deref()
+    }
+
     pub(crate) fn discover(&mut self, sources: Vec<WorkspaceRoot>) {
         self.workspaces = discover_workspaces(&sources);
         self.sources = sources;
-        if self
-            .selected_workspace_id
-            .as_ref()
-            .is_some_and(|id| !self.workspaces.iter().any(|workspace| &workspace.id == id))
-        {
-            self.selected_workspace_id = None;
-        }
+        self.reconcile_stored_workspaces();
     }
 
     pub(crate) fn sources(&self) -> &[WorkspaceRoot] {
@@ -496,28 +525,15 @@ impl TaskQueueModel {
             .collect()
     }
 
-    pub(crate) fn select_workspace(
-        &mut self,
-        workspace_id: WorkspaceId,
-    ) -> Result<(), TaskQueueError> {
-        if self
-            .workspaces
+    pub(crate) fn workspace(&self, workspace_id: &WorkspaceId) -> Option<&DiscoveredWorkspace> {
+        self.workspaces
             .iter()
-            .any(|workspace| workspace.id == workspace_id)
-        {
-            self.selected_workspace_id = Some(workspace_id);
-            Ok(())
-        } else {
-            Err(TaskQueueError::WorkspaceNotFound(workspace_id))
-        }
-    }
-
-    pub(crate) fn selected_workspace_id(&self) -> Option<&WorkspaceId> {
-        self.selected_workspace_id.as_ref()
+            .find(|workspace| &workspace.id == workspace_id)
     }
 
     pub(crate) fn insert_task(&mut self, task: Task) {
         self.tasks.insert(task.id.clone(), task);
+        self.reconcile_stored_workspaces();
     }
 
     /// Persists before updating the model, so a write failure cannot create an
@@ -542,16 +558,14 @@ impl TaskQueueModel {
         Ok(task)
     }
 
-    /// Creates a task in Warp's private active-channel application-data store
-    /// and selects it only after the store has published the staged task.
-    pub(crate) fn create_in_active_store_and_select(
+    /// Creates a task in Warp's private active-channel application-data store.
+    /// Selection is deliberately owned by the submitting workspace window.
+    pub(crate) fn create_in_active_store(
         &mut self,
         input: NewTaskInput,
     ) -> Result<Task, TaskStoreError> {
         let store = TaskStore::open_in_active_channel_data_directory();
-        let task = self.create_with_store(&store, input)?;
-        self.selected_task_id = Some(task.id.clone());
-        Ok(task)
+        self.create_with_store(&store, input)
     }
 
     /// Replaces the in-memory task snapshot with the valid entries loaded by
@@ -567,14 +581,9 @@ impl TaskQueueModel {
             .into_iter()
             .map(|task| (task.id.clone(), task))
             .collect();
-        if self
-            .selected_task_id
-            .as_ref()
-            .is_some_and(|task_id| !self.tasks.contains_key(task_id))
-        {
-            self.selected_task_id = None;
-        }
-        Ok(loaded.errors)
+        self.load_errors = loaded.errors;
+        self.reconcile_stored_workspaces();
+        Ok(self.load_errors.clone())
     }
 
     pub(crate) fn task(&self, task_id: &TaskId) -> Option<&Task> {
@@ -588,17 +597,39 @@ impl TaskQueueModel {
             .collect()
     }
 
-    pub(crate) fn select_task(&mut self, task_id: TaskId) -> Result<(), TaskQueueError> {
-        if self.tasks.contains_key(&task_id) {
-            self.selected_task_id = Some(task_id);
-            Ok(())
-        } else {
-            Err(TaskQueueError::TaskNotFound(task_id))
+    fn reload_from_store(&mut self, store: &TaskStore) {
+        match self.load_from_store(store) {
+            Ok(_) => self.store_load_error = None,
+            Err(error) => self.store_load_error = Some(error.to_string()),
         }
     }
 
-    pub(crate) fn selected_task_id(&self) -> Option<&TaskId> {
-        self.selected_task_id.as_ref()
+    fn reconcile_stored_workspaces(&mut self) {
+        let stored_workspaces = self
+            .tasks
+            .values()
+            .filter_map(|task| task.workspace.as_ref())
+            .collect::<Vec<_>>();
+        for stored_workspace in stored_workspaces {
+            if self
+                .workspaces
+                .iter()
+                .all(|workspace| workspace.id != stored_workspace.id)
+            {
+                self.workspaces
+                    .push(DiscoveredWorkspace::from_stored_workspace(stored_workspace));
+            }
+        }
+        self.workspaces.sort_by(|left, right| {
+            workspace_source_order(left.source)
+                .cmp(&workspace_source_order(right.source))
+                .then_with(|| {
+                    left.display_name
+                        .to_lowercase()
+                        .cmp(&right.display_name.to_lowercase())
+                })
+                .then_with(|| normalize_path(&left.path).cmp(&normalize_path(&right.path)))
+        });
     }
 }
 
@@ -607,6 +638,13 @@ impl Entity for TaskQueueModel {
 }
 
 impl SingletonEntity for TaskQueueModel {}
+
+const fn workspace_source_order(source: WorkspaceSource) -> u8 {
+    match source {
+        WorkspaceSource::Github => 0,
+        WorkspaceSource::ActiveProjects => 1,
+    }
+}
 
 fn discover_workspaces(sources: &[WorkspaceRoot]) -> Vec<DiscoveredWorkspace> {
     let mut workspaces_by_source = Vec::<(WorkspaceSource, Vec<DiscoveredWorkspace>)>::new();

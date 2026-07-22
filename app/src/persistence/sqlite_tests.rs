@@ -18,7 +18,7 @@ use super::{
 };
 use crate::app_state::{
     AppState, CodePaneSnapShot, CodePaneTabSnapshot, LeafContents, LeafSnapshot, PaneNodeSnapshot,
-    TabGroupSnapshot, TabSnapshot, TerminalPaneSnapshot, WindowSnapshot,
+    TabGroupSnapshot, TabSnapshot, TerminalPaneSnapshot, VerticalSidebarMode, WindowSnapshot,
 };
 use crate::cloud_object::{CloudObjectPermissions, Owner};
 use crate::code::editor_management::CodeSource;
@@ -141,7 +141,10 @@ fn sqlite_read_restores_app_state_and_codebase_metadata() {
     let mut conn = setup_database(&database_path).expect("database should initialize");
 
     let app_state = AppState {
-        windows: vec![test_terminal_window_snapshot(false)],
+        windows: vec![test_terminal_window_snapshot(
+            false,
+            VerticalSidebarMode::Sessions,
+        )],
         active_window_index: Some(0),
         block_lists: Default::default(),
         running_mcp_servers: Default::default(),
@@ -322,7 +325,10 @@ fn test_deduplicate_no_snapshots() {
     assert!(matches!(&filtered_events[0], &ModelEvent::SaveBlock(_)));
 }
 
-fn test_terminal_window_snapshot(vertical_tabs_panel_open: bool) -> WindowSnapshot {
+fn test_terminal_window_snapshot(
+    vertical_tabs_panel_open: bool,
+    vertical_sidebar_mode: VerticalSidebarMode,
+) -> WindowSnapshot {
     WindowSnapshot {
         tabs: vec![TabSnapshot {
             custom_title: None,
@@ -362,6 +368,7 @@ fn test_terminal_window_snapshot(vertical_tabs_panel_open: bool) -> WindowSnapsh
         warp_drive_index_width: None,
         left_panel_open: false,
         vertical_tabs_panel_open,
+        vertical_sidebar_mode,
         left_panel_width: None,
         right_panel_width: None,
         agent_management_filters: None,
@@ -370,15 +377,15 @@ fn test_terminal_window_snapshot(vertical_tabs_panel_open: bool) -> WindowSnapsh
 }
 
 #[test]
-fn test_sqlite_round_trips_vertical_tabs_panel_open() {
+fn test_sqlite_round_trips_vertical_sidebar_state() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let database_path = tempdir.path().join("warp.sqlite");
     let mut conn = setup_database(&database_path).expect("database should initialize");
 
     let app_state = AppState {
         windows: vec![
-            test_terminal_window_snapshot(false),
-            test_terminal_window_snapshot(true),
+            test_terminal_window_snapshot(false, VerticalSidebarMode::Sessions),
+            test_terminal_window_snapshot(true, VerticalSidebarMode::Tasks),
         ],
         active_window_index: Some(1),
         block_lists: Default::default(),
@@ -400,6 +407,43 @@ fn test_sqlite_round_trips_vertical_tabs_panel_open() {
             .map(|window| window.vertical_tabs_panel_open)
             .collect::<Vec<_>>(),
         vec![false, true]
+    );
+    assert_eq!(
+        restored
+            .windows
+            .iter()
+            .map(|window| window.vertical_sidebar_mode)
+            .collect::<Vec<_>>(),
+        vec![VerticalSidebarMode::Sessions, VerticalSidebarMode::Tasks]
+    );
+}
+
+#[test]
+fn test_sqlite_defaults_pre_sidebar_mode_windows_to_sessions() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let database_path = tempdir.path().join("warp.sqlite");
+    let mut conn = setup_database(&database_path).expect("database should initialize");
+    let app_state = AppState {
+        windows: vec![test_terminal_window_snapshot(
+            true,
+            VerticalSidebarMode::Tasks,
+        )],
+        active_window_index: Some(0),
+        block_lists: Default::default(),
+        running_mcp_servers: Default::default(),
+    };
+    save_app_state(&mut conn, &app_state).expect("app state should save");
+    conn.batch_execute("UPDATE windows SET vertical_sidebar_mode = NULL;")
+        .expect("legacy window row should be simulated");
+
+    let restored = read_sqlite_data(&mut conn, None, PersistedDataScope::Full)
+        .expect("app state should load")
+        .app_state
+        .expect("app state should be present for the full scope");
+
+    assert_eq!(
+        restored.windows[0].vertical_sidebar_mode,
+        VerticalSidebarMode::Sessions
     );
 }
 
@@ -449,6 +493,7 @@ fn test_sqlite_round_trips_custom_vertical_tabs_title() {
             warp_drive_index_width: None,
             left_panel_open: false,
             vertical_tabs_panel_open: false,
+            vertical_sidebar_mode: VerticalSidebarMode::Sessions,
             left_panel_width: None,
             right_panel_width: None,
             agent_management_filters: None,
@@ -527,6 +572,7 @@ fn test_sqlite_round_trips_code_pane_with_multiple_tabs() {
             warp_drive_index_width: None,
             left_panel_open: false,
             vertical_tabs_panel_open: false,
+            vertical_sidebar_mode: VerticalSidebarMode::Sessions,
             left_panel_width: None,
             right_panel_width: None,
             agent_management_filters: None,
@@ -645,6 +691,7 @@ fn test_sqlite_round_trips_tab_groups() {
             warp_drive_index_width: None,
             left_panel_open: false,
             vertical_tabs_panel_open: false,
+            vertical_sidebar_mode: VerticalSidebarMode::Sessions,
             left_panel_width: None,
             right_panel_width: None,
             agent_management_filters: None,
@@ -796,6 +843,7 @@ fn test_sqlite_round_trips_pinned_state() {
             warp_drive_index_width: None,
             left_panel_open: false,
             vertical_tabs_panel_open: false,
+            vertical_sidebar_mode: VerticalSidebarMode::Sessions,
             left_panel_width: None,
             right_panel_width: None,
             agent_management_filters: None,
@@ -941,7 +989,7 @@ fn test_sqlite_drops_too_small_bounds_on_save() {
     let database_path = tempdir.path().join("warp.sqlite");
     let mut conn = setup_database(&database_path).expect("database should initialize");
 
-    let mut snapshot = test_terminal_window_snapshot(false);
+    let mut snapshot = test_terminal_window_snapshot(false, VerticalSidebarMode::Sessions);
     snapshot.bounds = Some(RectF::new(
         Vector2F::new(0.0, -1410.0),
         Vector2F::new(1.0, 1410.0),
@@ -987,7 +1035,10 @@ fn test_sqlite_drops_too_small_bounds_on_read() {
     // Save with no bounds so a row exists, then corrupt it directly to bypass
     // the save-path guard and simulate a pre-existing bad row.
     let app_state = AppState {
-        windows: vec![test_terminal_window_snapshot(false)],
+        windows: vec![test_terminal_window_snapshot(
+            false,
+            VerticalSidebarMode::Sessions,
+        )],
         active_window_index: Some(0),
         block_lists: Default::default(),
         running_mcp_servers: Default::default(),

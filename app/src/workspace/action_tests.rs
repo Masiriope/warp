@@ -22,6 +22,12 @@ fn vertical_tabs_panel_toggle_still_saves_workspace_state() {
 }
 
 #[test]
+fn vertical_sidebar_mode_actions_save_workspace_state() {
+    assert!(WorkspaceAction::ShowTaskQueue.should_save_app_state_on_action());
+    assert!(WorkspaceAction::ShowSessions.should_save_app_state_on_action());
+}
+
+#[test]
 fn settings_popup_toggle_does_not_save_workspace_state() {
     assert!(!WorkspaceAction::ToggleVerticalTabsSettingsPopup.should_save_app_state_on_action());
 }

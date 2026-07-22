@@ -2810,6 +2810,7 @@ fn test_vertical_tabs_panel_visibility_restores_from_window_snapshot() {
         });
         let open_snapshot = workspace.update(&mut app, |workspace, ctx| {
             workspace.vertical_tabs_panel_open = true;
+            workspace.vertical_tabs_panel.show_task_queue();
             workspace.snapshot(ctx.window_id(), false, ctx)
         });
 
@@ -2821,6 +2822,10 @@ fn test_vertical_tabs_panel_visibility_restores_from_window_snapshot() {
         });
         restored_open.read(&app, |workspace, _| {
             assert!(workspace.vertical_tabs_panel_open);
+            assert_eq!(
+                workspace.vertical_tabs_panel.sidebar_mode(),
+                super::vertical_tabs::VerticalSidebarMode::Tasks
+            );
         });
     });
 }

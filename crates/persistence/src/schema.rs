@@ -453,6 +453,7 @@ diesel::table! {
         agent_management_filters -> Nullable<Text>,
         left_panel_open -> Nullable<Bool>,
         vertical_tabs_panel_open -> Nullable<Bool>,
+        vertical_sidebar_mode -> Nullable<Bool>,
     }
 }
 

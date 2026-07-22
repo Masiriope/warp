@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use super::{CommandTemplate, LaunchConfig, PaneMode, PaneTemplateType};
 use crate::app_state::{
     AppState, BranchSnapshot, LeafContents, LeafSnapshot, NotebookPaneSnapshot, PaneFlex,
-    PaneNodeSnapshot, SplitDirection, TabSnapshot, TerminalPaneSnapshot, WindowSnapshot,
+    PaneNodeSnapshot, SplitDirection, TabSnapshot, TerminalPaneSnapshot, VerticalSidebarMode,
+    WindowSnapshot,
 };
 use crate::drive::OpenWarpDriveObjectSettings;
 use crate::tab::SelectedTabColor;
@@ -30,6 +31,7 @@ fn single_tab_snapshot(root: PaneNodeSnapshot) -> AppState {
             warp_drive_index_width: None,
             left_panel_open: false,
             vertical_tabs_panel_open: false,
+            vertical_sidebar_mode: VerticalSidebarMode::Sessions,
             fullscreen_state: Default::default(),
             left_panel_width: None,
             right_panel_width: None,
@@ -55,6 +57,7 @@ fn multi_tab_snapshot(active_tab_index: usize, tabs: Vec<TabSnapshot>) -> AppSta
             warp_drive_index_width: None,
             left_panel_open: false,
             vertical_tabs_panel_open: false,
+            vertical_sidebar_mode: VerticalSidebarMode::Sessions,
             fullscreen_state: Default::default(),
             left_panel_width: None,
             right_panel_width: None,

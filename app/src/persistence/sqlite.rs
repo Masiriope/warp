@@ -966,6 +966,10 @@ fn save_app_state(conn: &mut SqliteConnection, app_state: &AppState) -> Result<(
                 warp_drive_index_width: window.warp_drive_index_width,
                 left_panel_open: Some(window.left_panel_open),
                 vertical_tabs_panel_open: Some(window.vertical_tabs_panel_open),
+                vertical_sidebar_mode: Some(matches!(
+                    window.vertical_sidebar_mode,
+                    crate::app_state::VerticalSidebarMode::Tasks
+                )),
                 fullscreen_state: window.fullscreen_state as i32,
                 agent_management_filters: window
                     .agent_management_filters
@@ -2676,6 +2680,12 @@ fn read_sqlite_data(
                         warp_drive_index_width: window.warp_drive_index_width,
                         left_panel_open: window_left_panel_open,
                         vertical_tabs_panel_open: window.vertical_tabs_panel_open.unwrap_or(false),
+                        vertical_sidebar_mode: match window.vertical_sidebar_mode {
+                            Some(true) => crate::app_state::VerticalSidebarMode::Tasks,
+                            // Existing rows predate the column and must retain
+                            // the original Sessions sidebar behavior.
+                            Some(false) | None => crate::app_state::VerticalSidebarMode::Sessions,
+                        },
                         fullscreen_state: fullscreen_state_val,
                         left_panel_width,
                         right_panel_width,
