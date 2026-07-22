@@ -528,6 +528,12 @@ pub enum Event {
     /// Event used to propagate a state change for one of the terminal views
     /// inside this pane group.
     TerminalViewStateChanged,
+    /// A terminal pane was actually closed from this pane group. This is
+    /// emitted only after any confirmation has been accepted and only when
+    /// the pane group itself remains open.
+    TerminalPaneClosed {
+        terminal_pane_id: TerminalPaneId,
+    },
     /// Event used to propagate guided onboarding tutorial completion to the workspace.
     OnboardingTutorialCompleted,
     // Tell the workspace to open the workflow modal.
@@ -4694,6 +4700,8 @@ impl PaneGroup {
             return;
         }
 
+        let terminal_pane_id = pane_id.as_terminal_pane_id();
+
         // Child agent panes return to off-tree state instead of being
         // destroyed; future pill clicks re-host the same view. The view
         // keeps ownership of its conversation, so we skip the
@@ -4837,6 +4845,9 @@ impl PaneGroup {
 
         self.handle_pane_count_change(ctx);
 
+        if let Some(terminal_pane_id) = terminal_pane_id {
+            ctx.emit(Event::TerminalPaneClosed { terminal_pane_id });
+        }
         ctx.emit(Event::TerminalViewStateChanged);
         ctx.emit(Event::AppStateChanged);
     }

@@ -2563,9 +2563,15 @@ impl Workspace {
         state: Arc<Mutex<TaskTerminalLaunchState>>,
         ctx: &mut ViewContext<Self>,
     ) {
-        ctx.subscribe_to_view(
-            &terminal_view,
-            move |workspace, terminal, event, ctx| match event {
+        ctx.subscribe_to_view(&terminal_view, move |workspace, terminal, event, ctx| {
+            if !workspace
+                .task_terminal_launches
+                .contains_key(&terminal_pane_id)
+            {
+                return;
+            }
+
+            match event {
                 terminal::Event::ShellSpawned(shell_type) => {
                     workspace.start_task_terminal_command(
                         &terminal,
@@ -2622,8 +2628,8 @@ impl Workspace {
                     }
                 }
                 _ => {}
-            },
-        );
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2719,6 +2725,23 @@ impl Workspace {
         } else {
             false
         }
+    }
+
+    fn handle_closed_task_terminal_pane(
+        &mut self,
+        terminal_pane_id: TerminalPaneId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(task_id) = self.task_terminal_launches.get(&terminal_pane_id).cloned() else {
+            return;
+        };
+
+        self.abandon_task_terminal_launch(
+            terminal_pane_id,
+            &task_id,
+            "El panel de la tarea se cerró antes de completar el comando.",
+            ctx,
+        );
     }
 
     fn require_task_launch_attention(
@@ -16595,6 +16618,9 @@ impl Workspace {
             pane_group::Event::TerminalViewStateChanged => {
                 self.update_active_session(ctx);
                 ctx.notify();
+            }
+            pane_group::Event::TerminalPaneClosed { terminal_pane_id } => {
+                self.handle_closed_task_terminal_pane(*terminal_pane_id, ctx);
             }
             pane_group::Event::OnboardingTutorialCompleted => {
                 self.pending_session_config_tab_config_chip = false;

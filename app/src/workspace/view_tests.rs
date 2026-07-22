@@ -802,6 +802,60 @@ fn closing_a_task_tab_requires_attention_without_touching_the_original_session()
 }
 
 #[test]
+fn closing_a_task_pane_in_a_confirmed_split_requires_attention_and_keeps_the_tab() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+        });
+        let (task_pane_group, task_terminal_pane_id, tab_count) =
+            workspace.read(&app, |workspace, ctx| {
+                (
+                    workspace.active_tab_pane_group().clone(),
+                    workspace
+                        .active_tab_pane_group()
+                        .as_ref(ctx)
+                        .active_session_id(ctx)
+                        .expect("task terminal should have a pane id"),
+                    workspace.tab_count(),
+                )
+            });
+
+        task_pane_group.update(&mut app, |pane_group, ctx| {
+            pane_group.add_terminal_pane(Direction::Right, None, ctx);
+            // This is the pane-group operation reached after any close
+            // confirmation has been accepted.
+            pane_group.close_pane(task_terminal_pane_id.into(), ctx);
+        });
+
+        let task = task_from_queue(&app, &task.id);
+        assert_eq!(task.status, TaskStatus::AttentionRequired);
+        assert_eq!(task.terminal_pane_id, None);
+        assert_eq!(
+            workspace.read(&app, |workspace, _| workspace.tab_count()),
+            tab_count
+        );
+        assert!(!task_pane_group.read(&app, |pane_group, _ctx| {
+            pane_group
+                .terminal_pane_ids()
+                .any(|pane_id| pane_id == task_terminal_pane_id.into())
+        }));
+    });
+}
+
+#[test]
 fn a_manual_terminal_event_never_changes_a_queued_task() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
