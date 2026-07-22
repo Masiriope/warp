@@ -94,6 +94,16 @@ impl TaskStore {
         self.tasks_root().join(&workspace_id.0).join(&task_id.0)
     }
 
+    /// The only Markdown path handed to a task launcher. It remains under
+    /// Warp's private application-data root, never the selected repository.
+    pub(crate) fn task_markdown_path(
+        &self,
+        workspace_id: &WorkspaceId,
+        task_id: &TaskId,
+    ) -> PathBuf {
+        self.task_directory(workspace_id, task_id).join(TASK_FILE)
+    }
+
     /// Persists a complete task in a staging directory and only publishes it
     /// by renaming the staged directory into the task tree after every write
     /// and the workspace index update have succeeded.
@@ -168,6 +178,29 @@ impl TaskStore {
         }
         tasks.sort_by(|left, right| left.id.0.cmp(&right.id.0));
         Ok(TaskList { tasks, errors })
+    }
+
+    /// Atomically replaces the Markdown metadata for an already-published
+    /// task. Attachments are immutable after creation, so no task directory is
+    /// removed or recreated while a launch transition is being persisted.
+    pub(crate) fn update(&self, task: &Task) -> Result<(), TaskStoreError> {
+        let workspace = task
+            .workspace
+            .as_ref()
+            .ok_or(TaskStoreError::WorkspaceMetadataMissing)?;
+        if workspace.id != task.workspace_id {
+            return Err(TaskStoreError::WorkspaceMetadataMismatch);
+        }
+        validate_path_component(&workspace.id.0)?;
+        validate_path_component(&task.id.0)?;
+        let task_file = self.task_markdown_path(&task.workspace_id, &task.id);
+        if !task_file.is_file() {
+            return Err(TaskStoreError::Invalid {
+                path: task_file,
+                reason: "task Markdown does not exist".into(),
+            });
+        }
+        self.write_atomic_file(&task_file, render_task_markdown(task)?.as_bytes())
     }
 
     fn write_staged_task(
@@ -278,7 +311,14 @@ impl TaskStore {
     }
 
     fn write_atomic_file(&self, path: &Path, bytes: &[u8]) -> Result<(), TaskStoreError> {
-        let temporary = path.with_file_name(format!("{WORKSPACES_FILE}.{}.tmp", Uuid::new_v4()));
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| TaskStoreError::Invalid {
+                path: path.to_path_buf(),
+                reason: "atomic write target has no UTF-8 filename".into(),
+            })?;
+        let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
         let result = (|| {
             self.write_file(&temporary, bytes)?;
             replace_file_without_removing_destination(&temporary, path, replace_existing_file)

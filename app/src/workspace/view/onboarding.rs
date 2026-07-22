@@ -241,7 +241,7 @@ impl Workspace {
         ctx.subscribe_to_view(
             &terminal_view_handle,
             move |me, terminal_view, event, ctx| {
-                if let terminal::Event::PendingCommandCompleted = event {
+                if let terminal::Event::PendingCommandCompleted { .. } = event {
                     // Start the onboarding tutorial now that setup is done.
                     // TODO(roland): We do have a directory in this case so we could consider passing has_project = true
                     // which has an optional /init flow. But the behavior of /init needs to be revisited:

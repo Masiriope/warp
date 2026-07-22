@@ -296,9 +296,6 @@ impl Task {
         }
     }
 
-    // Task 2 persists creation and loading only. Durable status-update methods
-    // are intentionally deferred; a future store update must commit before it
-    // mutates this in-memory state.
     pub(crate) fn mark_launched(
         &mut self,
         terminal_pane_id: impl Into<String>,
@@ -308,6 +305,7 @@ impl Task {
                 self.terminal_pane_id = Some(terminal_pane_id.into());
                 self.status = TaskStatus::InProgress;
                 self.attention_reason = None;
+                self.touch();
                 Ok(())
             }
             status => Err(TaskQueueError::InvalidTaskTransition {
@@ -326,6 +324,8 @@ impl Task {
             self.status = TaskStatus::AttentionRequired;
             self.attention_reason = Some("The command did not complete successfully.".into());
         }
+        self.terminal_pane_id = None;
+        self.touch();
         Ok(())
     }
 
@@ -334,9 +334,14 @@ impl Task {
         reason: impl Into<String>,
     ) -> Result<(), TaskQueueError> {
         match self.status {
-            TaskStatus::Pending | TaskStatus::InProgress | TaskStatus::ReviewRequired => {
+            TaskStatus::Pending
+            | TaskStatus::InProgress
+            | TaskStatus::ReviewRequired
+            | TaskStatus::AttentionRequired => {
                 self.status = TaskStatus::AttentionRequired;
                 self.attention_reason = Some(reason.into());
+                self.terminal_pane_id = None;
+                self.touch();
                 Ok(())
             }
             status => Err(TaskQueueError::InvalidTaskTransition {
@@ -349,7 +354,12 @@ impl Task {
     pub(crate) fn mark_done(&mut self) -> Result<(), TaskQueueError> {
         self.require_status(TaskStatus::ReviewRequired, "complete")?;
         self.status = TaskStatus::Done;
+        self.touch();
         Ok(())
+    }
+
+    fn touch(&mut self) {
+        self.updated_at_ms = task_timestamp_now();
     }
 
     fn require_status(
@@ -435,6 +445,16 @@ pub(crate) enum TaskQueueError {
     RelativeTaskMarkdownPath(PathBuf),
     #[error("task Markdown path must be named task.md: {0}")]
     InvalidTaskMarkdownPath(PathBuf),
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum TaskQueuePersistError {
+    #[error("task {0:?} no longer exists in the queue")]
+    TaskNotFound(TaskId),
+    #[error(transparent)]
+    Transition(#[from] TaskQueueError),
+    #[error(transparent)]
+    Storage(#[from] TaskStoreError),
 }
 
 #[derive(Default)]
@@ -616,6 +636,97 @@ impl TaskQueueModel {
             .values()
             .filter(|task| &task.workspace_id == workspace_id)
             .collect()
+    }
+
+    /// Applies a launch state transition only after replacing the durable
+    /// Markdown record. A failed write leaves the model's task untouched.
+    pub(crate) fn launch_with_store(
+        &mut self,
+        store: &TaskStore,
+        task_id: &TaskId,
+        agent_kind: AgentKind,
+        terminal_pane_id: impl Into<String>,
+    ) -> Result<Task, TaskQueuePersistError> {
+        let terminal_pane_id = terminal_pane_id.into();
+        self.update_task_with_store(store, task_id, |task| {
+            task.agent_kind = agent_kind;
+            task.mark_launched(terminal_pane_id)
+        })
+    }
+
+    /// Persists the linked command's terminal outcome before the sidebar is
+    /// allowed to render its next lifecycle state.
+    pub(crate) fn finish_linked_command_with_store(
+        &mut self,
+        store: &TaskStore,
+        task_id: &TaskId,
+        success: bool,
+    ) -> Result<Task, TaskQueuePersistError> {
+        self.update_task_with_store(store, task_id, |task| task.mark_command_finished(success))
+    }
+
+    pub(crate) fn require_linked_task_attention_with_store(
+        &mut self,
+        store: &TaskStore,
+        task_id: &TaskId,
+        reason: impl Into<String>,
+    ) -> Result<Task, TaskQueuePersistError> {
+        let reason = reason.into();
+        self.update_task_with_store(store, task_id, |task| task.mark_attention_required(reason))
+    }
+
+    pub(crate) fn launch_in_active_store(
+        &mut self,
+        task_id: &TaskId,
+        agent_kind: AgentKind,
+        terminal_pane_id: impl Into<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<Task, TaskQueuePersistError> {
+        let store = TaskStore::open_in_active_channel_data_directory();
+        let task = self.launch_with_store(&store, task_id, agent_kind, terminal_pane_id)?;
+        ctx.emit(TaskQueueEvent::Updated);
+        Ok(task)
+    }
+
+    pub(crate) fn finish_linked_command_in_active_store(
+        &mut self,
+        task_id: &TaskId,
+        success: bool,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<Task, TaskQueuePersistError> {
+        let store = TaskStore::open_in_active_channel_data_directory();
+        let task = self.finish_linked_command_with_store(&store, task_id, success)?;
+        ctx.emit(TaskQueueEvent::Updated);
+        Ok(task)
+    }
+
+    pub(crate) fn require_linked_task_attention_in_active_store(
+        &mut self,
+        task_id: &TaskId,
+        reason: impl Into<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<Task, TaskQueuePersistError> {
+        let store = TaskStore::open_in_active_channel_data_directory();
+        let task = self.require_linked_task_attention_with_store(&store, task_id, reason)?;
+        ctx.emit(TaskQueueEvent::Updated);
+        Ok(task)
+    }
+
+    fn update_task_with_store(
+        &mut self,
+        store: &TaskStore,
+        task_id: &TaskId,
+        mutate: impl FnOnce(&mut Task) -> Result<(), TaskQueueError>,
+    ) -> Result<Task, TaskQueuePersistError> {
+        let mut updated = self
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| TaskQueuePersistError::TaskNotFound(task_id.clone()))?;
+        mutate(&mut updated)?;
+        store.update(&updated)?;
+        self.tasks.insert(task_id.clone(), updated.clone());
+        Ok(updated)
     }
 
     fn reload_from_store(&mut self, store: &TaskStore) {

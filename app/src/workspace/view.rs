@@ -153,7 +153,10 @@ use super::tab_settings::{
     HeaderToolbarChipSelection, NewTabPlacement, TabSettings, TabSettingsChangedEvent,
     VerticalTabsDisplayGranularity, WorkspaceDecorationVisibility,
 };
-use super::task_queue::{TaskDialog, TaskDialogEvent, TaskQueueModel};
+use super::task_queue::{
+    AgentKind, TaskDialog, TaskDialogEvent, TaskId, TaskQueueModel, TaskStatus, TaskStore,
+    build_launch_command,
+};
 use super::util::{
     PaneViewLocator, TabMovement, TerminalSessionFallbackBehavior, WelcomeTipsViewState,
     WorkspaceMouseStates, WorkspaceState,
@@ -875,6 +878,22 @@ struct FileUploadSessions {
     /// Maps a local pane to the ID of the file upload it is responsible for.
     local_to_upload_id_map: HashMap<TerminalPaneId, RemoteUploadId>,
     upload_id_to_local_map: HashMap<RemoteUploadId, TerminalPaneId>,
+}
+
+/// Local, short-lived guard for the terminal events belonging to one queued
+/// task launch. The durable source of truth remains `TaskQueueModel`.
+#[derive(Default)]
+struct TaskTerminalLaunchState {
+    launch_persisted: bool,
+    finished: bool,
+}
+
+fn task_terminal_options(workspace_path: PathBuf) -> NewTerminalOptions {
+    NewTerminalOptions {
+        initial_directory: Some(workspace_path),
+        hide_homepage: true,
+        ..Default::default()
+    }
 }
 
 /// Controls the color palette used for a workspace banner.
@@ -2372,6 +2391,270 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    /// Opens a fresh, ordinary terminal tab for a queued task. The wrapper is
+    /// only executed after the task's InProgress link has been written to the
+    /// durable queue; it never runs in the task sidebar or in agent mode.
+    fn launch_task(&mut self, task_id: TaskId, agent: AgentKind, ctx: &mut ViewContext<Self>) {
+        let Some(task) = TaskQueueModel::as_ref(ctx).task(&task_id).cloned() else {
+            self.show_task_launch_error("La tarea ya no existe en la cola.", ctx);
+            return;
+        };
+
+        if !matches!(
+            task.status,
+            TaskStatus::Pending | TaskStatus::AttentionRequired
+        ) {
+            self.show_task_launch_error(
+                "La tarea ya está abierta o no puede volver a lanzarse desde este estado.",
+                ctx,
+            );
+            return;
+        }
+
+        let Some(workspace) = task.workspace else {
+            self.show_task_launch_error("La tarea no tiene un workspace asociado.", ctx);
+            return;
+        };
+        if !workspace.path.is_dir() {
+            self.show_task_launch_error(
+                "El workspace de esta tarea ya no está disponible; no se ha creado ningún terminal.",
+                ctx,
+            );
+            return;
+        }
+
+        let store = TaskStore::open_in_active_channel_data_directory();
+        let task_markdown = store.task_markdown_path(&task.workspace_id, &task.id);
+        let command = match build_launch_command(agent, &task_markdown) {
+            Ok(command) => command,
+            Err(error) => {
+                self.show_task_launch_error(
+                    format!("No se pudo preparar el comando de la tarea: {error}"),
+                    ctx,
+                );
+                return;
+            }
+        };
+
+        let Some((terminal_pane_id, terminal_view)) =
+            self.add_task_terminal_tab(workspace.path.clone(), ctx)
+        else {
+            self.require_task_launch_attention(
+                &task_id,
+                "No se pudo crear un terminal para lanzar la tarea.",
+                ctx,
+            );
+            return;
+        };
+
+        // The launch opens a normal visible session, so put the sidebar back
+        // on Sessions rather than leaving the user on a task action surface.
+        self.vertical_tabs_panel.show_sessions();
+        ctx.notify();
+
+        let terminal_pane_id = format!("{terminal_pane_id:?}");
+        let state = Arc::new(Mutex::new(TaskTerminalLaunchState::default()));
+        self.subscribe_to_task_terminal_launch(
+            terminal_view.clone(),
+            task_id.clone(),
+            agent,
+            terminal_pane_id.clone(),
+            command.clone(),
+            state.clone(),
+            ctx,
+        );
+
+        // A test terminal or a fast shell can already be live by the time the
+        // subscription is installed. Start it exactly once in that case too.
+        if let Some(shell_type) =
+            terminal_view.read(ctx, |terminal, ctx| terminal.active_session_shell_type(ctx))
+        {
+            self.start_task_terminal_command(
+                &terminal_view,
+                &task_id,
+                agent,
+                &terminal_pane_id,
+                &command,
+                shell_type,
+                &state,
+                ctx,
+            );
+        }
+    }
+
+    fn add_task_terminal_tab(
+        &mut self,
+        workspace_path: PathBuf,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<(TerminalPaneId, ViewHandle<TerminalView>)> {
+        self.add_tab_with_pane_layout(
+            PanesLayout::SingleTerminal(Box::new(task_terminal_options(workspace_path))),
+            Arc::new(HashMap::new()),
+            None,
+            ctx,
+        );
+
+        let pane_group = self.active_tab_pane_group().clone();
+        let terminal_pane_id = pane_group.as_ref(ctx).active_session_id(ctx)?;
+        let terminal_view = pane_group.as_ref(ctx).active_session_view(ctx)?;
+        Some((terminal_pane_id, terminal_view))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn subscribe_to_task_terminal_launch(
+        &mut self,
+        terminal_view: ViewHandle<TerminalView>,
+        task_id: TaskId,
+        agent: AgentKind,
+        terminal_pane_id: String,
+        command: String,
+        state: Arc<Mutex<TaskTerminalLaunchState>>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        ctx.subscribe_to_view(
+            &terminal_view,
+            move |workspace, terminal, event, ctx| match event {
+                terminal::Event::ShellSpawned(shell_type) => {
+                    workspace.start_task_terminal_command(
+                        &terminal,
+                        &task_id,
+                        agent,
+                        &terminal_pane_id,
+                        &command,
+                        *shell_type,
+                        &state,
+                        ctx,
+                    );
+                }
+                terminal::Event::PendingCommandCompleted { success } => {
+                    let should_finish = state
+                        .lock()
+                        .map(|mut state| {
+                            if state.launch_persisted && !state.finished {
+                                state.finished = true;
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if should_finish {
+                        workspace.finish_task_terminal_command(&task_id, *success, ctx);
+                        ctx.unsubscribe_to_view(&terminal);
+                    }
+                }
+                terminal::Event::PtySpawnFailed { reason } => {
+                    let should_mark_attention = state
+                        .lock()
+                        .map(|mut state| {
+                            if !state.finished {
+                                state.finished = true;
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if should_mark_attention {
+                        workspace.require_task_launch_attention(
+                            &task_id,
+                            format!("El terminal no pudo iniciarse: {reason}"),
+                            ctx,
+                        );
+                        ctx.unsubscribe_to_view(&terminal);
+                    }
+                }
+                _ => {}
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_task_terminal_command(
+        &mut self,
+        terminal_view: &ViewHandle<TerminalView>,
+        task_id: &TaskId,
+        agent: AgentKind,
+        terminal_pane_id: &str,
+        command: &str,
+        shell_type: ShellType,
+        state: &Arc<Mutex<TaskTerminalLaunchState>>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let should_launch = state
+            .lock()
+            .map(|state| !state.launch_persisted && !state.finished)
+            .unwrap_or(false);
+        if !should_launch {
+            return;
+        }
+
+        let result = TaskQueueModel::handle(ctx).update(ctx, |queue, ctx| {
+            queue.launch_in_active_store(task_id, agent, terminal_pane_id.to_owned(), ctx)
+        });
+        if let Err(error) = result {
+            if let Ok(mut state) = state.lock() {
+                state.finished = true;
+            }
+            self.show_task_launch_error(
+                format!("No se pudo guardar el inicio de la tarea: {error}"),
+                ctx,
+            );
+            return;
+        }
+
+        if let Ok(mut state) = state.lock() {
+            state.launch_persisted = true;
+        }
+        terminal_view.update(ctx, |terminal, ctx| {
+            terminal.execute_task_launch_command(command, shell_type, ctx);
+        });
+    }
+
+    fn finish_task_terminal_command(
+        &mut self,
+        task_id: &TaskId,
+        success: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let result = TaskQueueModel::handle(ctx).update(ctx, |queue, ctx| {
+            queue.finish_linked_command_in_active_store(task_id, success, ctx)
+        });
+        if let Err(error) = result {
+            self.show_task_launch_error(
+                format!("El terminal terminó, pero no se pudo actualizar la tarea: {error}"),
+                ctx,
+            );
+        }
+    }
+
+    fn require_task_launch_attention(
+        &mut self,
+        task_id: &TaskId,
+        reason: impl Into<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let reason = reason.into();
+        let result = TaskQueueModel::handle(ctx).update(ctx, |queue, ctx| {
+            queue.require_linked_task_attention_in_active_store(task_id, reason.clone(), ctx)
+        });
+        if let Err(error) = result {
+            self.show_task_launch_error(
+                format!("{reason} Tampoco se pudo guardar el diagnóstico: {error}"),
+                ctx,
+            );
+        } else {
+            self.show_task_launch_error(reason, ctx);
+        }
+    }
+
+    fn show_task_launch_error(&mut self, message: impl Into<String>, ctx: &mut ViewContext<Self>) {
+        self.toast_stack.update(ctx, |toast_stack, ctx| {
+            toast_stack.add_ephemeral_toast(DismissibleToast::error(message.into()), ctx);
+        });
+        ctx.notify();
     }
 
     #[cfg(feature = "local_fs")]
@@ -24105,11 +24388,10 @@ impl TypedActionView for Workspace {
                 }
                 ctx.notify();
             }
-            // Task 6 owns terminal creation and linked-session navigation.
-            // These typed actions are intentionally inert for now, so neither
-            // manually started terminals nor arbitrary CLI sessions are
-            // classified as task sessions.
-            LaunchTask { .. } | OpenLinkedTaskSession(_) => ctx.notify(),
+            LaunchTask { task_id, agent } => self.launch_task(task_id.clone(), *agent, ctx),
+            // A later task owns durable linked-session navigation. Do not
+            // classify manually started terminals as queue-linked sessions.
+            OpenLinkedTaskSession(_) => ctx.notify(),
             // Task 7 owns the durable status transition and its storage write.
             MarkTaskDone(_) => ctx.notify(),
             StartAgentOnboardingTutorial(tutorial) => {

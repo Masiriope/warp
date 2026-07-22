@@ -1878,7 +1878,9 @@ pub enum Event {
     },
     /// Emitted when a pending command (e.g. tab config setup commands) has
     /// been submitted and its block has completed.
-    PendingCommandCompleted,
+    PendingCommandCompleted {
+        success: bool,
+    },
     SessionBootstrapped,
     AnonymousUserSignup,
     ShellSpawned(ShellType),
@@ -12168,7 +12170,9 @@ impl TerminalView {
                         if !command_succeeded {
                             self.pending_command_queue.clear();
                         }
-                        ctx.emit(Event::PendingCommandCompleted);
+                        ctx.emit(Event::PendingCommandCompleted {
+                            success: command_succeeded,
+                        });
 
                         // If agent view entry was deferred until setup commands
                         // finished, enter it now (unless suppressed by onboarding).
@@ -15847,6 +15851,22 @@ impl TerminalView {
     pub fn execute_command_or_set_pending(&mut self, command: &str, ctx: &mut ViewContext<Self>) {
         self.set_pending_command(command, ctx);
         self.execute_pending_command((), ctx);
+    }
+
+    /// Runs a task-queue launch command through the normal pending-command
+    /// lifecycle. This deliberately does not enter agent mode or take over a
+    /// user's existing terminal session.
+    pub fn execute_task_launch_command(
+        &mut self,
+        command: &str,
+        shell_type: ShellType,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.set_and_execute_subshell_command(command, shell_type, ctx);
+        // `set_and_execute_subshell_command` also configures Warp's optional
+        // subshell auto-bootstrap path. Task wrappers are ordinary commands,
+        // so retaining that state could affect a later, unrelated subshell.
+        self.pending_auto_bootstrap_shell_type = None;
     }
 
     fn hide_slow_bootstrap_banner(&mut self, ctx: &mut ViewContext<Self>) {
@@ -25380,10 +25400,8 @@ impl TerminalView {
         // Attempt to auto warpify the subshell when bootstrapped
         self.pending_auto_bootstrap_shell_type = Some(shell_type);
 
-        self.input.update(ctx, |input, ctx| {
-            input.set_pending_command(shell_command, ctx);
-            input.execute_pending_command(ctx);
-        });
+        self.set_pending_command(shell_command, ctx);
+        self.execute_pending_command((), ctx);
     }
 
     fn invoke_env_vars_in_subshell(

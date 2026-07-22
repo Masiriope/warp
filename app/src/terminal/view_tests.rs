@@ -142,6 +142,22 @@ fn has_pending_user_query_block(view: &TerminalView) -> bool {
 }
 
 #[test]
+fn task_launch_command_enters_the_normal_pending_command_lifecycle() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.execute_task_launch_command("codexauto '/private/task.md'", ShellType::Zsh, ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            assert!(view.has_pending_command_or_awaiting_completion(ctx));
+        });
+    });
+}
+
+#[test]
 fn agent_view_lifecycle_updates_input_mode() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);

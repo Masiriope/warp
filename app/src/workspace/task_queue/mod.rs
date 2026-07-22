@@ -7,8 +7,8 @@ mod task_dialog;
 pub(crate) use command::{build_launch_command, shell_quote};
 pub(crate) use model::{
     AgentKind, DiscoveredWorkspace, NewTaskInput, Task, TaskAttachment, TaskId, TaskPriority,
-    TaskQueueError, TaskQueueModel, TaskStatus, TaskWorkspace, WorkspaceId, WorkspaceRoot,
-    WorkspaceSource, default_sources,
+    TaskQueueError, TaskQueueModel, TaskQueuePersistError, TaskStatus, TaskWorkspace, WorkspaceId,
+    WorkspaceRoot, WorkspaceSource, default_sources,
 };
 pub(crate) use panel::{TaskPanelSelection, render_task_queue_panel};
 pub(crate) use storage::{TaskLoadError, TaskStore, TaskStoreError};

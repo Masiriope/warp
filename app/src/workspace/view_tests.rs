@@ -86,6 +86,17 @@ use crate::workspaces::team_tester::TeamTesterStatus;
 use crate::workspaces::update_manager::TeamUpdateManager;
 use crate::workspaces::user_profiles::UserProfiles;
 use crate::workspaces::user_workspaces::UserWorkspaces;
+
+#[test]
+fn task_terminal_options_open_a_normal_hidden_homepage_session_in_the_workspace() {
+    let workspace_path = PathBuf::from("/tmp/task-workspace");
+
+    let options = task_terminal_options(workspace_path.clone());
+
+    assert_eq!(options.initial_directory, Some(workspace_path));
+    assert!(options.hide_homepage);
+    assert!(options.conversation_restoration.is_none());
+}
 use crate::{
     AgentNotificationsModel, GlobalResourceHandlesProvider, ObjectActions, experiments, workspace,
 };

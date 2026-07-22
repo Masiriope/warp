@@ -66,8 +66,8 @@ pub use registry::WorkspaceRegistry;
 // Re-exported for workspace modules added in subsequent task-queue work.
 pub(crate) use task_queue::{
     AgentKind, DiscoveredWorkspace, NewTaskInput, Task, TaskAttachment, TaskId, TaskPriority,
-    TaskQueueError, TaskQueueModel, TaskStatus, WorkspaceId, WorkspaceRoot, WorkspaceSource,
-    default_sources,
+    TaskQueueError, TaskQueueModel, TaskQueuePersistError, TaskStatus, WorkspaceId, WorkspaceRoot,
+    WorkspaceSource, default_sources,
 };
 pub use toast_stack::ToastStack;
 

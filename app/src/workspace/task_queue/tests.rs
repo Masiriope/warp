@@ -377,6 +377,126 @@ fn model_inserts_a_task_only_after_the_store_persists_it() {
 }
 
 #[test]
+fn launch_transition_is_persisted_before_the_model_exposes_in_progress() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+    let created = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("task should persist");
+    let mut model = TaskQueueModel::new();
+    model
+        .load_from_store(&store)
+        .expect("task should load into the queue");
+
+    let launched = model
+        .launch_with_store(
+            &store,
+            &created.id,
+            AgentKind::ClaudeCode,
+            "terminal-pane-1",
+        )
+        .expect("launch transition should persist");
+
+    assert_eq!(launched.status, TaskStatus::InProgress);
+    assert_eq!(launched.agent_kind, AgentKind::ClaudeCode);
+    assert_eq!(
+        launched.terminal_pane_id.as_deref(),
+        Some("terminal-pane-1")
+    );
+    assert_eq!(model.task(&created.id), Some(&launched));
+    assert_eq!(
+        store.list().expect("persisted task should reload").tasks,
+        vec![launched]
+    );
+}
+
+#[test]
+fn failed_linked_command_is_persisted_as_attention_required_without_a_session_link() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+    let created = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("task should persist");
+    let mut model = TaskQueueModel::new();
+    model
+        .load_from_store(&store)
+        .expect("task should load into the queue");
+    model
+        .launch_with_store(&store, &created.id, AgentKind::Codex, "terminal-pane-1")
+        .expect("launch transition should persist");
+
+    let completed = model
+        .finish_linked_command_with_store(&store, &created.id, false)
+        .expect("failed command transition should persist");
+
+    assert_eq!(completed.status, TaskStatus::AttentionRequired);
+    assert_eq!(completed.terminal_pane_id, None);
+    assert!(completed.attention_reason.is_some());
+    assert_eq!(
+        store.list().expect("persisted task should reload").tasks,
+        vec![completed]
+    );
+}
+
+#[test]
+fn successful_linked_command_is_persisted_as_review_required_without_a_session_link() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+    let created = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("task should persist");
+    let mut model = TaskQueueModel::new();
+    model
+        .load_from_store(&store)
+        .expect("task should load into the queue");
+    model
+        .launch_with_store(&store, &created.id, AgentKind::Codex, "terminal-pane-1")
+        .expect("launch transition should persist");
+
+    let completed = model
+        .finish_linked_command_with_store(&store, &created.id, true)
+        .expect("successful command transition should persist");
+
+    assert_eq!(completed.status, TaskStatus::ReviewRequired);
+    assert_eq!(completed.terminal_pane_id, None);
+    assert_eq!(
+        store.list().expect("persisted task should reload").tasks,
+        vec![completed]
+    );
+}
+
+#[test]
+fn failed_launch_persistence_keeps_the_model_task_pending_and_unlinked() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+    let created = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("task should persist");
+    let mut model = TaskQueueModel::new();
+    model
+        .load_from_store(&store)
+        .expect("task should load into the queue");
+    fs::remove_file(store.task_markdown_path(&created.workspace_id, &created.id))
+        .expect("task file should be removed to force a persistence error");
+
+    assert!(
+        model
+            .launch_with_store(&store, &created.id, AgentKind::Codex, "terminal-pane-1")
+            .is_err()
+    );
+
+    let unchanged = model
+        .task(&created.id)
+        .expect("model task should remain available");
+    assert_eq!(unchanged.status, TaskStatus::Pending);
+    assert_eq!(unchanged.terminal_pane_id, None);
+}
+
+#[test]
 fn model_uses_discovered_workspace_metadata_when_persisting_an_input_by_id() {
     let data = tempfile::tempdir().expect("data directory should be created");
     let sources = tempfile::tempdir().expect("workspace sources should be created");
