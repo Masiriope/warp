@@ -2136,6 +2136,7 @@ impl Workspace {
         });
         let modal = ctx.add_typed_action_view(|ctx| {
             Modal::new(Some("Crear tarea".into()), body, ctx)
+                .with_max_height_percentage(0.85)
                 .with_modal_style(UiComponentStyles {
                     width: Some(600.),
                     height: Some(640.),

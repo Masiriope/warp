@@ -1,9 +1,11 @@
+use std::sync::Arc;
+
 use uuid::Uuid;
 use warpui::assets::asset_cache::{AssetCache, AssetSource};
 use warpui::elements::{
-    Border, CacheOption, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
-    Flex, Image, MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement, Radius,
-    Shrinkable,
+    Border, CacheOption, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
+    Container, CornerRadius, CrossAxisAlignment, Fill, Flex, Image, MainAxisAlignment,
+    MainAxisSize, MouseStateHandle, ParentElement, Radius, ScrollbarWidth, Shrinkable,
 };
 use warpui::fonts::Weight;
 use warpui::image_cache::ImageType;
@@ -20,19 +22,16 @@ use crate::editor::{EditorOptions, EditorView, Event as EditorEvent, TextOptions
 use crate::ui_components::blended_colors;
 use crate::view_components::action_button::{ActionButton, ButtonSize, NakedTheme, PrimaryTheme};
 
-const SUPPORTED_IMAGE_MIME_TYPES: [&str; 5] = [
-    "image/png",
-    "image/jpeg",
-    "image/gif",
-    "image/webp",
-    "image/svg+xml",
-];
+const SUPPORTED_IMAGE_MIME_TYPES: [&str; 3] = ["image/png", "image/jpeg", "image/webp"];
+const INVALID_IMAGE_HEADER_ERROR: &str = "The pasted image has an invalid or unsupported header.";
+const IMAGE_TOO_LARGE_ERROR: &str = "The pasted image is too large to attach.";
+const WORKSPACE_SELECTOR_MAX_HEIGHT: f32 = 176.;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TaskDialogAttachment {
     file_name: String,
     mime_type: String,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
 }
 
 impl TaskDialogAttachment {
@@ -65,6 +64,8 @@ pub(crate) struct TaskDialogState {
 impl TaskDialogState {
     pub(crate) const MAX_ATTACHMENTS: usize = 8;
     pub(crate) const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+    pub(crate) const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
+    pub(crate) const MAX_DECODED_RGBA_BYTES: u64 = 64 * 1024 * 1024;
 
     pub(crate) fn select_workspace(&mut self, workspace_id: WorkspaceId) {
         self.workspace_id = Some(workspace_id);
@@ -118,17 +119,17 @@ impl TaskDialogState {
     pub(crate) fn add_pasted_image(
         &mut self,
         mime_type: impl AsRef<str>,
-        bytes: Vec<u8>,
+        bytes: impl Into<Arc<[u8]>>,
     ) -> Result<(), &'static str> {
         let mime_type = mime_type.as_ref();
-        if !SUPPORTED_IMAGE_MIME_TYPES.contains(&mime_type)
-            || !matches_image_mime_type(mime_type, &bytes)
-        {
-            return Err("Only PNG, JPEG, GIF, WebP, or SVG images can be attached.");
+        if !SUPPORTED_IMAGE_MIME_TYPES.contains(&mime_type) {
+            return Err("Only PNG, JPEG, or WebP images can be attached.");
         }
+        let bytes = bytes.into();
         if bytes.len() > Self::MAX_ATTACHMENT_BYTES {
             return Err("Each pasted image must be 10 MiB or smaller.");
         }
+        validate_raster_image_header(mime_type, &bytes)?;
         if self.attachments.len() >= Self::MAX_ATTACHMENTS {
             return Err("A task can include at most 8 pasted images.");
         }
@@ -205,6 +206,9 @@ pub(crate) struct TaskDialog {
     workspace_mouse_states: Vec<MouseStateHandle>,
     priority_mouse_states: [MouseStateHandle; 3],
     attachment_remove_mouse_states: Vec<MouseStateHandle>,
+    workspace_scroll_state: ClippedScrollStateHandle,
+    form_scroll_state: ClippedScrollStateHandle,
+    thumbnail_asset_slots: Vec<String>,
     thumbnail_asset_ids: Vec<String>,
     paste_error: Option<String>,
     submit_button: ViewHandle<ActionButton>,
@@ -258,6 +262,11 @@ impl TaskDialog {
                 .on_click(|ctx| ctx.dispatch_typed_action(TaskDialogAction::Cancel))
         });
 
+        let thumbnail_asset_namespace = Uuid::new_v4();
+        let thumbnail_asset_slots = (0..TaskDialogState::MAX_ATTACHMENTS)
+            .map(|slot| format!("task-dialog-thumbnail-{thumbnail_asset_namespace}-{slot}"))
+            .collect();
+
         Self {
             state: TaskDialogState::default(),
             workspaces: Vec::new(),
@@ -270,6 +279,9 @@ impl TaskDialog {
                 MouseStateHandle::default(),
             ],
             attachment_remove_mouse_states: Vec::new(),
+            workspace_scroll_state: Default::default(),
+            form_scroll_state: Default::default(),
+            thumbnail_asset_slots,
             thumbnail_asset_ids: Vec::new(),
             paste_error: None,
             submit_button,
@@ -355,13 +367,23 @@ impl TaskDialog {
         self.state.append_pasted_text(clipboard.plain_text);
 
         for image in clipboard.images.unwrap_or_default() {
+            let Some(asset_id) = self.next_thumbnail_asset_id() else {
+                // State enforces the same eight-image limit. Keep this
+                // defensive branch so a UI/cache mismatch never causes an
+                // unbounded new asset ID to be generated.
+                self.paste_error = Some("No se pudo reservar la previsualización.".into());
+                continue;
+            };
             match self.state.add_pasted_image(&image.mime_type, image.data) {
                 Ok(()) => {
                     let Some(attachment) = self.state.attachments().last() else {
                         self.paste_error = Some("No se pudo preparar la imagen pegada.".into());
                         continue;
                     };
-                    let asset_id = format!("task-dialog-thumbnail-{}", Uuid::new_v4());
+
+                    // `add_pasted_image` performed all header and decoded-size
+                    // checks before this cache insertion can trigger any image
+                    // decode work.
                     AssetCache::handle(ctx).update(ctx, |asset_cache, ctx| {
                         asset_cache.insert_raw_asset_bytes::<ImageType>(
                             asset_id.clone(),
@@ -382,6 +404,16 @@ impl TaskDialog {
             editor.set_buffer_text(&context, ctx);
         });
         ctx.notify();
+    }
+
+    /// Returns one of the fixed, per-dialog thumbnail slots. Opening and
+    /// cancelling the dialog repeatedly therefore replaces at most eight raw
+    /// assets instead of allocating a new UUID-backed cache entry per paste.
+    fn next_thumbnail_asset_id(&self) -> Option<String> {
+        self.thumbnail_asset_slots
+            .iter()
+            .find(|asset_id| !self.thumbnail_asset_ids.contains(*asset_id))
+            .cloned()
     }
 
     fn sync_submit_button(&mut self, ctx: &mut ViewContext<Self>) {
@@ -480,6 +512,24 @@ impl TaskDialog {
             );
         }
         selector.finish()
+    }
+
+    fn render_scrollable_workspace_selector(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let selector = ClippedScrollable::vertical(
+            self.workspace_scroll_state.clone(),
+            self.render_workspace_selector(appearance),
+            ScrollbarWidth::Auto,
+            theme.nonactive_ui_text_color().into(),
+            theme.active_ui_text_color().into(),
+            Fill::None,
+        )
+        .with_overlayed_scrollbar()
+        .finish();
+
+        ConstrainedBox::new(selector)
+            .with_max_height(WORKSPACE_SELECTOR_MAX_HEIGHT)
+            .finish()
     }
 
     fn render_priority_selector(&self, appearance: &Appearance) -> Box<dyn Element> {
@@ -599,7 +649,7 @@ impl View for TaskDialog {
         // required non-text field and makes task ownership explicit.
         form.add_child(self.render_label("Espacio de trabajo", appearance));
         form.add_child(
-            Container::new(self.render_workspace_selector(appearance))
+            Container::new(self.render_scrollable_workspace_selector(appearance))
                 .with_margin_top(6.)
                 .finish(),
         );
@@ -672,10 +722,25 @@ impl View for TaskDialog {
             );
         }
 
+        let theme = appearance.theme();
+        let scrollable_form = ClippedScrollable::vertical(
+            self.form_scroll_state.clone(),
+            form.finish(),
+            ScrollbarWidth::Auto,
+            theme.nonactive_ui_text_color().into(),
+            theme.active_ui_text_color().into(),
+            Fill::None,
+        )
+        .with_overlayed_scrollbar()
+        .finish();
+
         Container::new(
             Flex::column()
                 .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_child(form.finish())
+                // Scroll only the fields. The footer remains in the modal so
+                // Create and Cancel stay reachable even with many workspaces
+                // or the maximum number of pasted-image rows.
+                .with_child(Shrinkable::new(1., scrollable_form).finish())
                 .with_child(
                     Container::new(
                         Flex::row()
@@ -720,14 +785,37 @@ impl TypedActionView for TaskDialog {
                 self.attachment_remove_mouse_states.remove(*index);
                 ctx.notify();
             }
-            TaskDialogAction::Submit => match self.state.clone().into_new_task_input() {
-                Ok(input) => ctx.emit(TaskDialogEvent::Submitted(input)),
-                Err(error) => {
-                    self.paste_error = Some(error.to_owned());
+            TaskDialogAction::Submit => {
+                if !self.state.can_submit() {
+                    self.paste_error = Some(
+                        if self.state.workspace_id().is_none() {
+                            "Select a workspace before creating a task."
+                        } else {
+                            "A task title is required."
+                        }
+                        .to_owned(),
+                    );
                     self.sync_submit_button(ctx);
                     ctx.notify();
+                    return;
                 }
-            },
+
+                // Move state into the event rather than cloning every pasted
+                // image buffer on submit. Workspace's event boundary may clone
+                // the input, but attachments carry Arc<[u8]> and remain shared.
+                let state = std::mem::take(&mut self.state);
+                match state.into_new_task_input() {
+                    Ok(input) => ctx.emit(TaskDialogEvent::Submitted(input)),
+                    Err(error) => {
+                        // `can_submit` checked the same invariants above. This
+                        // is retained for future validation additions without
+                        // silently dropping the user's draft.
+                        self.paste_error = Some(error.to_owned());
+                        self.sync_submit_button(ctx);
+                        ctx.notify();
+                    }
+                }
+            }
             TaskDialogAction::Cancel => ctx.emit(TaskDialogEvent::Cancelled),
         }
     }
@@ -737,23 +825,128 @@ fn file_extension_for_mime_type(mime_type: &str) -> &'static str {
     match mime_type {
         "image/png" => "png",
         "image/jpeg" => "jpg",
-        "image/gif" => "gif",
         "image/webp" => "webp",
-        "image/svg+xml" => "svg",
         _ => "img",
     }
 }
 
-fn matches_image_mime_type(mime_type: &str, bytes: &[u8]) -> bool {
-    match mime_type {
-        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
-        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
-        "image/svg+xml" => std::str::from_utf8(bytes).ok().is_some_and(|text| {
-            let text = text.trim_start();
-            text.starts_with("<svg") || (text.starts_with("<?xml") && text.contains("<svg"))
-        }),
-        _ => false,
+/// Validates only the inexpensive container/header fields needed to establish
+/// safe dimensions. In particular, it never asks an image decoder to expand
+/// attacker-controlled data before the pixel and RGBA-memory budgets hold.
+fn validate_raster_image_header(mime_type: &str, bytes: &[u8]) -> Result<(), &'static str> {
+    let dimensions = match mime_type {
+        "image/png" => png_dimensions(bytes),
+        "image/jpeg" => jpeg_dimensions(bytes),
+        "image/webp" => webp_dimensions(bytes),
+        _ => None,
+    }
+    .ok_or(INVALID_IMAGE_HEADER_ERROR)?;
+
+    let (width, height) = dimensions;
+    if width == 0 || height == 0 {
+        return Err(INVALID_IMAGE_HEADER_ERROR);
+    }
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or(IMAGE_TOO_LARGE_ERROR)?;
+    let decoded_rgba_bytes = pixels.checked_mul(4).ok_or(IMAGE_TOO_LARGE_ERROR)?;
+    if pixels > TaskDialogState::MAX_IMAGE_PIXELS
+        || decoded_rgba_bytes > TaskDialogState::MAX_DECODED_RGBA_BYTES
+    {
+        return Err(IMAGE_TOO_LARGE_ERROR);
+    }
+    Ok(())
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() < 24 || !bytes.starts_with(PNG_SIGNATURE) || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    Some((
+        u32::from_be_bytes(bytes[16..20].try_into().ok()?),
+        u32::from_be_bytes(bytes[20..24].try_into().ok()?),
+    ))
+}
+
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || !bytes.starts_with(&[0xff, 0xd8]) {
+        return None;
+    }
+
+    let mut index = 2;
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index] == 0xff {
+            index += 1;
+        }
+        let marker = *bytes.get(index)?;
+        index += 1;
+
+        match marker {
+            0x01 | 0xd0..=0xd7 => continue,
+            0xd9 | 0xda => return None,
+            _ => {}
+        }
+
+        let segment_length = usize::from(u16::from_be_bytes([
+            *bytes.get(index)?,
+            *bytes.get(index + 1)?,
+        ]));
+        if segment_length < 2 || index.checked_add(segment_length)? > bytes.len() {
+            return None;
+        }
+        if is_jpeg_start_of_frame(marker) {
+            if segment_length < 8 {
+                return None;
+            }
+            let height = u32::from(u16::from_be_bytes([bytes[index + 3], bytes[index + 4]]));
+            let width = u32::from(u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]));
+            return Some((width, height));
+        }
+        index += segment_length;
+    }
+    None
+}
+
+fn is_jpeg_start_of_frame(marker: u8) -> bool {
+    matches!(
+        marker,
+        0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf
+    )
+}
+
+fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 20 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return None;
+    }
+    let riff_length = usize::try_from(u32::from_le_bytes(bytes[4..8].try_into().ok()?)).ok()?;
+    if riff_length.checked_add(8)? > bytes.len() {
+        return None;
+    }
+
+    let chunk_length = usize::try_from(u32::from_le_bytes(bytes[16..20].try_into().ok()?)).ok()?;
+    if chunk_length > bytes.len().checked_sub(20)? {
+        return None;
+    }
+
+    match &bytes[12..16] {
+        b"VP8X" if chunk_length >= 10 && bytes.len() >= 30 => Some((
+            1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]),
+            1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]),
+        )),
+        b"VP8 " if chunk_length >= 10 && bytes.len() >= 30 => {
+            if &bytes[23..26] != b"\x9d\x01\x2a" {
+                return None;
+            }
+            Some((
+                u32::from(u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3fff),
+                u32::from(u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3fff),
+            ))
+        }
+        b"VP8L" if chunk_length >= 5 && bytes.len() >= 25 && bytes[20] == 0x2f => {
+            let dimensions = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
+            Some((1 + (dimensions & 0x3fff), 1 + ((dimensions >> 14) & 0x3fff)))
+        }
+        _ => None,
     }
 }

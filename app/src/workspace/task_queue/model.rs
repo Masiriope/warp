@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -166,7 +167,7 @@ pub(crate) struct TaskAttachment {
     /// single staged write publishes the task. Persisted task snapshots always
     /// have this cleared and use `path` as their attachment reference.
     #[serde(skip)]
-    pub(crate) bytes: Option<Vec<u8>>,
+    pub(crate) bytes: Option<Arc<[u8]>>,
 }
 
 impl TaskAttachment {
@@ -181,7 +182,7 @@ impl TaskAttachment {
     /// Creates an attachment from a Command-V image without creating a
     /// temporary file. `TaskStore` writes these bytes only as part of its
     /// staged, atomic task-creation transaction.
-    pub(crate) fn from_memory(file_name: impl Into<String>, bytes: Vec<u8>) -> Self {
+    pub(crate) fn from_memory(file_name: impl Into<String>, bytes: Arc<[u8]>) -> Self {
         Self {
             path: PathBuf::new(),
             file_name: Some(file_name.into()),
@@ -198,6 +199,13 @@ impl TaskAttachment {
 
     pub(crate) fn in_memory_bytes(&self) -> Option<&[u8]> {
         self.bytes.as_deref()
+    }
+
+    /// Keeps clipboard data shared from dialog state through the event
+    /// boundary. Cloning `NewTaskInput` then clones only this small Arc, never
+    /// the untrusted image payload itself.
+    pub(crate) fn in_memory_bytes_arc(&self) -> Option<&Arc<[u8]>> {
+        self.bytes.as_ref()
     }
 }
 
