@@ -153,6 +153,7 @@ use super::tab_settings::{
     HeaderToolbarChipSelection, NewTabPlacement, TabSettings, TabSettingsChangedEvent,
     VerticalTabsDisplayGranularity, WorkspaceDecorationVisibility,
 };
+use super::task_queue::{TaskDialog, TaskDialogEvent, TaskQueueModel};
 use super::util::{
     PaneViewLocator, TabMovement, TerminalSessionFallbackBehavior, WelcomeTipsViewState,
     WorkspaceMouseStates, WorkspaceState,
@@ -1069,6 +1070,7 @@ pub struct Workspace {
     launch_config_save_modal: ModalViewState<LaunchConfigSaveModal>,
     tab_config_params_modal: ModalViewState<Modal<TabConfigParamsModal>>,
     session_config_modal: ModalViewState<Modal<SessionConfigModal>>,
+    task_dialog: ModalViewState<Modal<TaskDialog>>,
     pending_session_config_replacement: Option<PendingSessionConfigReplacement>,
     /// When set, the guided onboarding tutorial will start after the session
     /// config modal is closed (submitted or dismissed).
@@ -2127,6 +2129,32 @@ impl Workspace {
         ModalViewState::new(modal)
     }
 
+    fn build_task_dialog(ctx: &mut ViewContext<Self>) -> ModalViewState<Modal<TaskDialog>> {
+        let body = ctx.add_typed_action_view(TaskDialog::new);
+        ctx.subscribe_to_view(&body, |me, _, event, ctx| {
+            me.handle_task_dialog_event(event, ctx);
+        });
+        let modal = ctx.add_typed_action_view(|ctx| {
+            Modal::new(Some("Crear tarea".into()), body, ctx)
+                .with_modal_style(UiComponentStyles {
+                    width: Some(600.),
+                    height: Some(640.),
+                    ..Default::default()
+                })
+                .with_body_style(UiComponentStyles {
+                    padding: Some(Coords::uniform(0.)),
+                    height: Some(560.),
+                    ..Default::default()
+                })
+        });
+        ctx.subscribe_to_view(&modal, |me, _, event, ctx| {
+            if matches!(event, ModalEvent::Close) {
+                me.close_task_dialog(ctx);
+            }
+        });
+        ModalViewState::new(modal)
+    }
+
     fn build_new_worktree_modal(
         ctx: &mut ViewContext<Self>,
     ) -> ModalViewState<Modal<NewWorktreeModal>> {
@@ -2315,6 +2343,31 @@ impl Workspace {
         }
     }
 
+    fn handle_task_dialog_event(&mut self, event: &TaskDialogEvent, ctx: &mut ViewContext<Self>) {
+        match event {
+            TaskDialogEvent::Cancelled => self.close_task_dialog(ctx),
+            TaskDialogEvent::Submitted(input) => {
+                let result = TaskQueueModel::handle(ctx).update(ctx, |queue, _| {
+                    queue.create_in_active_store_and_select(input.clone())
+                });
+                match result {
+                    Ok(_) => self.close_task_dialog(ctx),
+                    Err(error) => {
+                        self.toast_stack.update(ctx, |toast_stack, ctx| {
+                            toast_stack.add_ephemeral_toast(
+                                DismissibleToast::error(format!(
+                                    "No se pudo crear la tarea: {error}"
+                                )),
+                                ctx,
+                            );
+                        });
+                        ctx.notify();
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "local_fs")]
     fn handle_session_config_completed(
         &mut self,
@@ -2462,6 +2515,33 @@ impl Workspace {
         self.show_session_config_tab_config_chip = false;
         ctx.focus(&self.session_config_modal.view);
         send_telemetry_from_ctx!(TabConfigsTelemetryEvent::GuidedModalOpened, ctx);
+        ctx.notify();
+    }
+
+    /// Opens the native task-creation modal programmatically. Task 5 will add
+    /// the typed Workspace action/entry point; this task deliberately does not
+    /// add any global keybinding or terminal UI wiring.
+    #[allow(
+        dead_code,
+        reason = "Task 5 supplies the typed action that invokes this programmatic modal entry point."
+    )]
+    pub(crate) fn open_task_dialog(&mut self, ctx: &mut ViewContext<Self>) {
+        let queue = TaskQueueModel::as_ref(ctx);
+        let workspaces = queue.workspaces().to_vec();
+        let selected_workspace_id = queue.selected_workspace_id().cloned();
+        self.task_dialog.view.update(ctx, |modal, ctx| {
+            modal.body().update(ctx, |body, ctx| {
+                body.configure(workspaces, selected_workspace_id, ctx);
+            });
+        });
+        self.task_dialog.open();
+        ctx.focus(&self.task_dialog.view);
+        ctx.notify();
+    }
+
+    fn close_task_dialog(&mut self, ctx: &mut ViewContext<Self>) {
+        self.task_dialog.close();
+        self.focus_active_tab(ctx);
         ctx.notify();
     }
 
@@ -3027,6 +3107,7 @@ impl Workspace {
         let new_worktree_modal = Self::build_new_worktree_modal(ctx);
 
         let session_config_modal = Self::build_session_config_modal(ctx);
+        let task_dialog = Self::build_task_dialog(ctx);
 
         let enable_auto_reload_modal = Self::build_enable_auto_reload_modal(ctx);
 
@@ -3414,6 +3495,7 @@ impl Workspace {
             launch_config_save_modal,
             tab_config_params_modal,
             session_config_modal,
+            task_dialog,
             pending_session_config_replacement: None,
             pending_onboarding_intention: None,
             pending_session_config_tab_config_chip: false,
@@ -27093,6 +27175,10 @@ impl View for Workspace {
 
         if self.session_config_modal.is_open() {
             stack.add_child(self.session_config_modal.render());
+        }
+
+        if self.task_dialog.is_open() {
+            stack.add_child(self.task_dialog.render());
         }
 
         if self.should_show_session_config_tab_config_chip() {

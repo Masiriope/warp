@@ -162,6 +162,11 @@ pub(crate) struct TaskAttachment {
     pub(crate) path: PathBuf,
     #[serde(skip)]
     pub(crate) file_name: Option<String>,
+    /// Pasted task-dialog images are held in memory until the task store's
+    /// single staged write publishes the task. Persisted task snapshots always
+    /// have this cleared and use `path` as their attachment reference.
+    #[serde(skip)]
+    pub(crate) bytes: Option<Vec<u8>>,
 }
 
 impl TaskAttachment {
@@ -169,6 +174,18 @@ impl TaskAttachment {
         Self {
             path: path.into(),
             file_name: None,
+            bytes: None,
+        }
+    }
+
+    /// Creates an attachment from a Command-V image without creating a
+    /// temporary file. `TaskStore` writes these bytes only as part of its
+    /// staged, atomic task-creation transaction.
+    pub(crate) fn from_memory(file_name: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            path: PathBuf::new(),
+            file_name: Some(file_name.into()),
+            bytes: Some(bytes),
         }
     }
 
@@ -177,6 +194,10 @@ impl TaskAttachment {
     pub(crate) fn with_file_name(mut self, file_name: impl Into<String>) -> Self {
         self.file_name = Some(file_name.into());
         self
+    }
+
+    pub(crate) fn in_memory_bytes(&self) -> Option<&[u8]> {
+        self.bytes.as_deref()
     }
 }
 
@@ -510,6 +531,18 @@ impl TaskQueueModel {
         };
         let task = store.create(input)?;
         self.insert_task(task.clone());
+        Ok(task)
+    }
+
+    /// Creates a task in Warp's private active-channel application-data store
+    /// and selects it only after the store has published the staged task.
+    pub(crate) fn create_in_active_store_and_select(
+        &mut self,
+        input: NewTaskInput,
+    ) -> Result<Task, TaskStoreError> {
+        let store = TaskStore::open_in_active_channel_data_directory();
+        let task = self.create_with_store(&store, input)?;
+        self.selected_task_id = Some(task.id.clone());
         Ok(task)
     }
 

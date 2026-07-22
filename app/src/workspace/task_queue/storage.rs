@@ -80,12 +80,7 @@ impl TaskStore {
     /// Opens storage below Warp's private, active-channel application-data
     /// directory. `data_dir` is channel aware (`.warp`, `.warp-dev`, etc.).
     ///
-    /// Reserved for the UI startup wiring that is intentionally outside this
-    /// storage-only task.
-    #[expect(
-        dead_code,
-        reason = "Task queue UI startup wiring is intentionally deferred to a later task."
-    )]
+    /// Used by task-creation UI to keep queue data out of selected workspaces.
     pub(crate) fn open_in_active_channel_data_directory() -> Self {
         Self::open(warp_core::paths::data_dir())
     }
@@ -192,11 +187,15 @@ impl TaskStore {
             }
 
             let destination = attachments_directory.join(&filename);
-            fs::copy(&attachment.path, &destination).map_err(|source| TaskStoreError::Io {
-                path: attachment.path.clone(),
-                source,
-            })?;
-            self.sync_file(&destination)?;
+            if let Some(bytes) = attachment.in_memory_bytes() {
+                self.write_file(&destination, bytes)?;
+            } else {
+                fs::copy(&attachment.path, &destination).map_err(|source| TaskStoreError::Io {
+                    path: attachment.path.clone(),
+                    source,
+                })?;
+                self.sync_file(&destination)?;
+            }
             let reference = canonical_attachment_reference(&filename)?;
             stored_attachments.push(TaskAttachment::new(PathBuf::from(reference)));
         }

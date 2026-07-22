@@ -1,6 +1,7 @@
 mod command;
 mod model;
 mod storage;
+mod task_dialog;
 
 pub(crate) use command::{build_launch_command, shell_quote};
 pub(crate) use model::{
@@ -9,7 +10,12 @@ pub(crate) use model::{
     WorkspaceSource, default_sources,
 };
 pub(crate) use storage::{TaskLoadError, TaskStore, TaskStoreError};
+pub(crate) use task_dialog::{TaskDialog, TaskDialogEvent, TaskDialogState};
 
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "task_dialog_tests.rs"]
+mod task_dialog_tests;
