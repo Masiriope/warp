@@ -35,7 +35,7 @@ pub(crate) enum TaskPriority {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) enum AgentKind {
+pub enum AgentKind {
     #[default]
     Codex,
     ClaudeCode,
@@ -150,7 +150,7 @@ impl TaskWorkspace {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub(crate) struct TaskId(pub(crate) String);
+pub struct TaskId(pub(crate) String);
 
 impl TaskId {
     pub(crate) fn new(value: impl Into<String>) -> Self {

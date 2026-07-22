@@ -75,6 +75,7 @@ use crate::workspace::tab_settings::{
     TabSettings, VerticalTabsCompactSubtitle, VerticalTabsDisplayGranularity,
     VerticalTabsPrimaryInfo, VerticalTabsTabItemMode, VerticalTabsViewMode,
 };
+use crate::workspace::task_queue::{WorkspaceId, render_task_queue_panel};
 use crate::workspace::view::vertical_tabs::telemetry::{
     VerticalTabsChipEntrypoint, VerticalTabsTelemetryEvent,
 };
@@ -711,6 +712,8 @@ pub(super) struct VerticalTabsPanelState {
     new_tab_hover_state: MouseStateHandle,
     new_tab_button_state: MouseStateHandle,
     pub(super) search_query: String,
+    sidebar_mode: VerticalSidebarMode,
+    pending_task_workspace_selection: Arc<Mutex<Option<WorkspaceId>>>,
     settings_button_mouse_state: MouseStateHandle,
     panes_segment_mouse_state: MouseStateHandle,
     tabs_segment_mouse_state: MouseStateHandle,
@@ -749,6 +752,8 @@ impl Default for VerticalTabsPanelState {
             new_tab_hover_state: Default::default(),
             new_tab_button_state: Default::default(),
             search_query: String::new(),
+            sidebar_mode: VerticalSidebarMode::Sessions,
+            pending_task_workspace_selection: Arc::new(Mutex::new(None)),
             settings_button_mouse_state: Default::default(),
             panes_segment_mouse_state: Default::default(),
             tabs_segment_mouse_state: Default::default(),
@@ -771,7 +776,39 @@ impl Default for VerticalTabsPanelState {
     }
 }
 
+/// Determines which body is displayed below the native vertical-tabs controls.
+/// Session rendering remains the default and keeps its existing data path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum VerticalSidebarMode {
+    #[default]
+    Sessions,
+    Tasks,
+}
+
 impl VerticalTabsPanelState {
+    pub(super) fn sidebar_mode(&self) -> VerticalSidebarMode {
+        self.sidebar_mode
+    }
+
+    pub(super) fn show_task_queue(&mut self) {
+        self.sidebar_mode = VerticalSidebarMode::Tasks;
+    }
+
+    pub(super) fn show_sessions(&mut self) {
+        self.sidebar_mode = VerticalSidebarMode::Sessions;
+    }
+
+    pub(super) fn pending_task_workspace_selection(&self) -> Arc<Mutex<Option<WorkspaceId>>> {
+        self.pending_task_workspace_selection.clone()
+    }
+
+    pub(super) fn take_pending_task_workspace_selection(&self) -> Option<WorkspaceId> {
+        self.pending_task_workspace_selection
+            .lock()
+            .ok()
+            .and_then(|mut selection| selection.take())
+    }
+
     /// Returns a lightweight handle bundle for workspace-level visibility reconciliation while the
     /// detail sidecar is active.
     pub(super) fn detail_hover_state(&self, window_id: WindowId) -> VerticalTabsDetailHoverState {
@@ -1417,7 +1454,10 @@ fn render_control_bar(
         .finish();
 
     let settings_button = render_settings_button(state, appearance);
-    let new_tab_button = render_new_tab_button(state, workspace, appearance, app);
+    let primary_button = match state.sidebar_mode() {
+        VerticalSidebarMode::Sessions => render_new_tab_button(state, workspace, appearance, app),
+        VerticalSidebarMode::Tasks => render_new_task_button(state, appearance),
+    };
 
     Container::new(
         Flex::row()
@@ -1426,7 +1466,7 @@ fn render_control_bar(
             .with_spacing(CONTROL_BAR_SPACING)
             .with_child(Shrinkable::new(1., search_bar).finish())
             .with_child(settings_button)
-            .with_child(new_tab_button)
+            .with_child(primary_button)
             .finish(),
     )
     .with_padding(
@@ -1434,6 +1474,81 @@ fn render_control_bar(
             .with_left(GROUP_HORIZONTAL_PADDING)
             .with_right(GROUP_HORIZONTAL_PADDING),
     )
+    .finish()
+}
+
+fn render_new_task_button(
+    state: &VerticalTabsPanelState,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let button = Container::new(
+        Text::new_inline("Nueva tarea", appearance.ui_font_family(), 11.)
+            .with_color(theme.main_text_color(theme.background()).into())
+            .finish(),
+    )
+    .with_padding(Padding::uniform(0.).with_horizontal(8.).with_vertical(6.))
+    .with_background(internal_colors::fg_overlay_3(theme))
+    .with_corner_radius(CornerRadius::with_all(CONTROL_BAR_BUTTON_RADIUS))
+    .finish();
+
+    Hoverable::new(state.new_tab_button_state.clone(), move |_| button)
+        .with_cursor(Cursor::PointingHand)
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(WorkspaceAction::OpenTaskDialog))
+        .finish()
+}
+
+fn render_vertical_sidebar_mode_toggle(
+    state: &VerticalTabsPanelState,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let render_segment =
+        |label: &'static str, mode: VerticalSidebarMode, action: WorkspaceAction| {
+            let is_selected = state.sidebar_mode() == mode;
+            let text_color = if is_selected {
+                theme.main_text_color(theme.background())
+            } else {
+                theme.sub_text_color(theme.background())
+            };
+            let segment = Container::new(
+                Text::new_inline(label, appearance.ui_font_family(), 11.)
+                    .with_color(text_color.into())
+                    .finish(),
+            )
+            .with_padding(Padding::uniform(0.).with_horizontal(8.).with_vertical(5.))
+            .with_corner_radius(CornerRadius::with_all(CONTROL_BAR_BUTTON_RADIUS));
+            let segment = if is_selected {
+                segment.with_background(internal_colors::fg_overlay_3(theme))
+            } else {
+                segment
+            }
+            .finish();
+            Hoverable::new(MouseStateHandle::default(), move |_| segment)
+                .with_cursor(Cursor::PointingHand)
+                .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+                .finish()
+        };
+
+    Container::new(
+        Flex::row()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(2.)
+            .with_child(render_segment(
+                "Sesiones",
+                VerticalSidebarMode::Sessions,
+                WorkspaceAction::ShowSessions,
+            ))
+            .with_child(render_segment(
+                "Tareas",
+                VerticalSidebarMode::Tasks,
+                WorkspaceAction::ShowTaskQueue,
+            ))
+            .finish(),
+    )
+    .with_padding(Padding::uniform(0.).with_horizontal(8.).with_vertical(4.))
     .finish()
 }
 
@@ -1657,9 +1772,23 @@ fn render_vertical_tabs_panel(
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
 
+    let sidebar_body = Flex::column()
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+        .with_child(render_vertical_sidebar_mode_toggle(state, app))
+        .with_child(match state.sidebar_mode() {
+            VerticalSidebarMode::Sessions => render_groups(state, workspace, app),
+            VerticalSidebarMode::Tasks => render_task_queue_panel(
+                state.pending_task_workspace_selection(),
+                &state.search_query,
+                app,
+            ),
+        })
+        .finish();
+
     let scrollable_groups = ClippedScrollable::vertical(
         state.scroll_state.clone(),
-        render_groups(state, workspace, app),
+        sidebar_body,
         ScrollbarWidth::Custom(4.),
         theme.nonactive_ui_detail().into(),
         theme.active_ui_detail().into(),
@@ -1685,7 +1814,9 @@ fn render_vertical_tabs_panel(
     // resolves to "after the last tab" instead of no target (which un-hides the
     // dragged pane and reflows the list). The framework's smallest-area
     // hit-test keeps the inner row targets winning where they overlap.
-    let panel_content: Box<dyn Element> = if any_workspace_pane_being_dragged(workspace, app) {
+    let panel_content: Box<dyn Element> = if state.sidebar_mode() == VerticalSidebarMode::Sessions
+        && any_workspace_pane_being_dragged(workspace, app)
+    {
         let tab_count = workspace.tabs.len();
         DropTarget::new(
             panel_content,
@@ -1710,6 +1841,7 @@ fn render_vertical_tabs_panel(
     };
     // Wrap the panel in a `Hoverable` so right-clicking the empty area of the
     // vertical tabs panel opens the tab configs dropdown.
+    let sidebar_mode = state.sidebar_mode();
     let inner = Hoverable::new(state.panel_right_click_mouse_state.clone(), |_| {
         Container::new(panel_with_popup)
             .with_background(internal_colors::fg_overlay_1(theme))
@@ -1718,15 +1850,17 @@ fn render_vertical_tabs_panel(
     .on_click(|ctx, _, _| {
         ctx.dispatch_typed_action(WorkspaceAction::CancelActiveRename);
     })
-    .on_right_click(|ctx, _, position| {
-        if FeatureFlag::GroupedTabs.is_enabled() {
+    .on_right_click(move |ctx, _, position| {
+        if sidebar_mode == VerticalSidebarMode::Sessions && FeatureFlag::GroupedTabs.is_enabled() {
             ctx.dispatch_typed_action(WorkspaceAction::OpenNewSessionMenu {
                 anchor: NewSessionMenuAnchor::Pointer(position),
             });
         }
     })
-    .on_double_click(|ctx, _, _| {
-        ctx.dispatch_typed_action(WorkspaceAction::AddDefaultTab);
+    .on_double_click(move |ctx, _, _| {
+        if sidebar_mode == VerticalSidebarMode::Sessions {
+            ctx.dispatch_typed_action(WorkspaceAction::AddDefaultTab);
+        }
     })
     .with_defer_events_to_children()
     .finish();

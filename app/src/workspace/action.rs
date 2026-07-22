@@ -46,6 +46,7 @@ use crate::themes::theme_chooser::ThemeChooserMode;
 use crate::workflows::{WorkflowSelectionSource, WorkflowSource, WorkflowType};
 use crate::workspace::PaneViewLocator;
 use crate::workspace::tab_group::TabGroupId;
+use crate::workspace::task_queue::{AgentKind, TaskId};
 
 /// This enum determines how the search query is initialized when opening command search.
 #[derive(Clone, Default, Debug)]
@@ -126,6 +127,24 @@ pub enum AutoCloudHandoffTrigger {
 
 #[derive(Debug, Clone)]
 pub enum WorkspaceAction {
+    /// Shows the task queue in the vertical sidebar. A pending workspace
+    /// selection staged by the sidebar is applied by `Workspace`.
+    ShowTaskQueue,
+    /// Restores the familiar terminal-session list in the vertical sidebar.
+    ShowSessions,
+    /// Opens the native task-creation dialog.
+    OpenTaskDialog,
+    /// Selects a task for details without starting an agent or terminal.
+    SelectTask(TaskId),
+    /// Deferred launch request. Task 6 owns terminal creation.
+    LaunchTask {
+        task_id: TaskId,
+        agent: AgentKind,
+    },
+    /// Deferred linked-session navigation. Task 6 owns its implementation.
+    OpenLinkedTaskSession(TaskId),
+    /// Deferred durable completion. Task 7 owns its implementation.
+    MarkTaskDone(TaskId),
     ActivateTab(usize),
     ActivatePrevTab,
     ActivateNextTab,
@@ -1196,6 +1215,13 @@ impl WorkspaceAction {
             | ShowHandoffEnvironmentCreationModal
             | ShowCloudModeV2EnvironmentCreationModal
             | OpenCreateAuthSecretModal { .. }
+            | ShowTaskQueue
+            | ShowSessions
+            | OpenTaskDialog
+            | SelectTask(_)
+            | LaunchTask { .. }
+            | OpenLinkedTaskSession(_)
+            | MarkTaskDone(_)
             | OpenNetworkLogPane => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,

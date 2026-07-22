@@ -2349,7 +2349,11 @@ impl Workspace {
             TaskDialogEvent::Cancelled => self.close_task_dialog(ctx),
             TaskDialogEvent::Submitted(input) => {
                 let result = TaskQueueModel::handle(ctx).update(ctx, |queue, _| {
-                    queue.create_in_active_store_and_select(input.clone())
+                    let task = queue.create_in_active_store_and_select(input.clone());
+                    if task.is_ok() {
+                        let _ = queue.select_workspace(input.workspace_id.clone());
+                    }
+                    task
                 });
                 match result {
                     Ok(_) => self.close_task_dialog(ctx),
@@ -24069,6 +24073,34 @@ impl TypedActionView for Workspace {
             AddAmbientAgentTab => self.add_ambient_agent_tab(ctx),
             AddAgentTab => self.add_terminal_tab_with_new_agent_view(ctx),
             AddDockerSandboxTab => self.add_docker_sandbox_tab(ctx),
+            ShowTaskQueue => {
+                self.vertical_tabs_panel.show_task_queue();
+                if let Some(workspace_id) = self
+                    .vertical_tabs_panel
+                    .take_pending_task_workspace_selection()
+                {
+                    let _ = TaskQueueModel::handle(ctx)
+                        .update(ctx, |queue, _| queue.select_workspace(workspace_id));
+                }
+                ctx.notify();
+            }
+            ShowSessions => {
+                self.vertical_tabs_panel.show_sessions();
+                ctx.notify();
+            }
+            OpenTaskDialog => self.open_task_dialog(ctx),
+            SelectTask(task_id) => {
+                let _ = TaskQueueModel::handle(ctx)
+                    .update(ctx, |queue, _| queue.select_task(task_id.clone()));
+                ctx.notify();
+            }
+            // Task 6 owns terminal creation and linked-session navigation.
+            // These typed actions are intentionally inert for now, so neither
+            // manually started terminals nor arbitrary CLI sessions are
+            // classified as task sessions.
+            LaunchTask { .. } | OpenLinkedTaskSession(_) => ctx.notify(),
+            // Task 7 owns the durable status transition and its storage write.
+            MarkTaskDone(_) => ctx.notify(),
             StartAgentOnboardingTutorial(tutorial) => {
                 self.start_agent_onboarding_tutorial(tutorial.clone(), ctx)
             }

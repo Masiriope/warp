@@ -1,5 +1,6 @@
 mod command;
 mod model;
+mod panel;
 mod storage;
 mod task_dialog;
 
@@ -9,6 +10,7 @@ pub(crate) use model::{
     TaskQueueError, TaskQueueModel, TaskStatus, TaskWorkspace, WorkspaceId, WorkspaceRoot,
     WorkspaceSource, default_sources,
 };
+pub(crate) use panel::render_task_queue_panel;
 pub(crate) use storage::{TaskLoadError, TaskStore, TaskStoreError};
 pub(crate) use task_dialog::{TaskDialog, TaskDialogEvent, TaskDialogState};
 
@@ -19,3 +21,7 @@ mod tests;
 #[cfg(test)]
 #[path = "task_dialog_tests.rs"]
 mod task_dialog_tests;
+
+#[cfg(test)]
+#[path = "panel_tests.rs"]
+mod panel_tests;
