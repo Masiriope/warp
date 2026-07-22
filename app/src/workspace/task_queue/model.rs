@@ -13,7 +13,7 @@ use std::os::windows::ffi::OsStrExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use warpui::{Entity, SingletonEntity};
+use warpui::{Entity, ModelContext, SingletonEntity};
 
 use super::{TaskLoadError, TaskStore, TaskStoreError};
 
@@ -447,6 +447,13 @@ pub(crate) struct TaskQueueModel {
     initialization_error: Option<TaskQueueError>,
 }
 
+/// Signals that the durable queue changed and every workspace sidebar should
+/// refresh its view of the shared task data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TaskQueueEvent {
+    Updated,
+}
+
 impl TaskQueueModel {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -558,14 +565,28 @@ impl TaskQueueModel {
         Ok(task)
     }
 
+    /// Persists a task and broadcasts the resulting queue change to every
+    /// workspace window. Selection remains local to the submitting window.
+    pub(crate) fn create_with_store_and_notify(
+        &mut self,
+        store: &TaskStore,
+        input: NewTaskInput,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<Task, TaskStoreError> {
+        let task = self.create_with_store(store, input)?;
+        ctx.emit(TaskQueueEvent::Updated);
+        Ok(task)
+    }
+
     /// Creates a task in Warp's private active-channel application-data store.
     /// Selection is deliberately owned by the submitting workspace window.
     pub(crate) fn create_in_active_store(
         &mut self,
         input: NewTaskInput,
+        ctx: &mut ModelContext<Self>,
     ) -> Result<Task, TaskStoreError> {
         let store = TaskStore::open_in_active_channel_data_directory();
-        self.create_with_store(&store, input)
+        self.create_with_store_and_notify(&store, input, ctx)
     }
 
     /// Replaces the in-memory task snapshot with the valid entries loaded by
@@ -634,7 +655,7 @@ impl TaskQueueModel {
 }
 
 impl Entity for TaskQueueModel {
-    type Event = ();
+    type Event = TaskQueueEvent;
 }
 
 impl SingletonEntity for TaskQueueModel {}

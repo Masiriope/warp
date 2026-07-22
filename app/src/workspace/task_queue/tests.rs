@@ -1,16 +1,20 @@
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(unix)]
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 
+use super::model::TaskQueueEvent;
 use super::{
     AgentKind, NewTaskInput, Task, TaskAttachment, TaskId, TaskPriority, TaskQueueError,
     TaskQueueModel, TaskStatus, TaskStore, TaskWorkspace, WorkspaceId, WorkspaceRoot,
     WorkspaceSource, build_launch_command, default_sources, shell_quote,
 };
+use warpui::App;
 
 fn stored_workspace(root: &Path) -> TaskWorkspace {
     TaskWorkspace::new(
@@ -480,6 +484,39 @@ fn model_can_load_persisted_tasks_without_coupling_storage_to_ui() {
 
     assert!(errors.is_empty());
     assert_eq!(model.task(&task.id), Some(&task));
+}
+
+#[test]
+fn task_queue_creation_notifies_each_window_subscriber() {
+    App::test((), |mut app| async move {
+        let data = tempfile::tempdir().expect("data directory should be created");
+        let workspace = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let queue = app.add_model(|_| TaskQueueModel::new());
+        let notifications = Arc::new(AtomicUsize::new(0));
+        app.update(|ctx| {
+            for _ in 0..2 {
+                let notifications = notifications.clone();
+                ctx.subscribe_to_model(&queue, move |_, event: &TaskQueueEvent, _| {
+                    if matches!(event, TaskQueueEvent::Updated) {
+                        notifications.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        queue.update(&mut app, |queue, ctx| {
+            queue
+                .create_with_store_and_notify(
+                    &store,
+                    stored_task_input(stored_workspace(workspace.path())),
+                    ctx,
+                )
+                .expect("task should persist and notify");
+        });
+
+        assert_eq!(notifications.load(Ordering::Relaxed), 2);
+    });
 }
 
 #[test]

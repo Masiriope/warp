@@ -981,6 +981,7 @@ pub struct TransferredTab {
     pub custom_title: Option<String>,
     pub left_panel_open: bool,
     pub vertical_tabs_panel_open: bool,
+    pub vertical_sidebar_mode: VerticalSidebarMode,
     pub right_panel_open: bool,
     pub is_right_panel_maximized: bool,
     pub draggable_state: DraggableState,
@@ -2348,8 +2349,9 @@ impl Workspace {
         match event {
             TaskDialogEvent::Cancelled => self.close_task_dialog(ctx),
             TaskDialogEvent::Submitted(input) => {
-                let result = TaskQueueModel::handle(ctx)
-                    .update(ctx, |queue, _| queue.create_in_active_store(input.clone()));
+                let result = TaskQueueModel::handle(ctx).update(ctx, |queue, ctx| {
+                    queue.create_in_active_store(input.clone(), ctx)
+                });
                 match result {
                     Ok(task) => {
                         self.vertical_tabs_panel
@@ -3233,6 +3235,9 @@ impl Workspace {
         ctx.subscribe_to_model(&CLIAgentSessionsModel::handle(ctx), |me, _, event, ctx| {
             me.handle_cli_agent_sessions_event(event, ctx);
         });
+        ctx.subscribe_to_model(&TaskQueueModel::handle(ctx), |_me, _, _event, ctx| {
+            ctx.notify();
+        });
 
         ctx.subscribe_to_model(
             &AgentNotificationsModel::handle(ctx),
@@ -3985,6 +3990,10 @@ impl Workspace {
             NewWorkspaceSource::Restored {
                 window_snapshot, ..
             } => window_snapshot.vertical_sidebar_mode,
+            NewWorkspaceSource::TransferredTab {
+                vertical_sidebar_mode,
+                ..
+            } => *vertical_sidebar_mode,
             _ => VerticalSidebarMode::Sessions,
         };
         self.vertical_tabs_panel.set_sidebar_mode(sidebar_mode);
@@ -27874,6 +27883,7 @@ impl Workspace {
         let right_panel_open = pane_group.read(ctx, |pg, _| pg.right_panel_open);
         let is_right_panel_maximized = pane_group.read(ctx, |pg, _| pg.is_right_panel_maximized);
         let vertical_tabs_panel_open = self.vertical_tabs_panel_open;
+        let vertical_sidebar_mode = self.vertical_tabs_panel.sidebar_mode();
 
         Some(TransferredTab {
             pane_group,
@@ -27884,6 +27894,7 @@ impl Workspace {
             is_right_panel_maximized,
             draggable_state,
             vertical_tabs_panel_open,
+            vertical_sidebar_mode,
         })
     }
 

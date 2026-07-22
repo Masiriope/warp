@@ -2,12 +2,13 @@ use std::path::PathBuf;
 
 use crate::workspace::action::WorkspaceAction;
 
+use super::TaskLoadError;
 use super::model::{
     AgentKind, Task, TaskAttachment, TaskId, TaskPriority, TaskStatus, WorkspaceId,
 };
 use super::panel::{
     TaskSessionRow, partition_task_linked_sessions, task_actions_for, task_presentation,
-    tasks_for_selected_workspace,
+    task_queue_diagnostics, tasks_for_selected_workspace,
 };
 
 fn task(id: &str, workspace_id: &WorkspaceId, priority: TaskPriority, status: TaskStatus) -> Task {
@@ -108,4 +109,23 @@ fn task_panel_selection_only_selects_and_action_mapping_is_deterministic() {
         actions.mark_done,
         WorkspaceAction::MarkTaskDone(id) if id == task_id
     ));
+}
+
+#[test]
+fn task_queue_diagnostics_surface_partial_load_and_store_failures() {
+    let diagnostics = task_queue_diagnostics(
+        &[TaskLoadError {
+            path: PathBuf::from("/private/TaskQueue/broken/task.md"),
+            reason: "missing title".to_owned(),
+        }],
+        Some("task directory cannot be read"),
+    );
+
+    assert_eq!(
+        diagnostics,
+        vec![
+            "No se pudo cargar la cola de tareas: task directory cannot be read".to_owned(),
+            "No se pudo cargar /private/TaskQueue/broken/task.md: missing title".to_owned(),
+        ]
+    );
 }

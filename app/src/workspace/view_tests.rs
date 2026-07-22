@@ -288,6 +288,7 @@ fn restored_workspace(
 fn transferred_tab_workspace(
     app: &mut App,
     vertical_tabs_panel_open: bool,
+    vertical_sidebar_mode: super::vertical_tabs::VerticalSidebarMode,
 ) -> ViewHandle<Workspace> {
     let global_resource_handles = GlobalResourceHandles::mock(app);
     let (_, workspace) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
@@ -299,6 +300,7 @@ fn transferred_tab_workspace(
                 custom_title: None,
                 left_panel_open: false,
                 vertical_tabs_panel_open,
+                vertical_sidebar_mode,
                 right_panel_open: false,
                 is_right_panel_maximized: false,
                 is_tab_drag_preview: false,
@@ -2945,14 +2947,26 @@ fn test_vertical_tabs_panel_inherits_transferred_tab_source_window_state() {
             });
         });
 
-        let transferred_closed = transferred_tab_workspace(&mut app, false);
-        let transferred_open = transferred_tab_workspace(&mut app, true);
+        let transferred_closed = transferred_tab_workspace(
+            &mut app,
+            false,
+            super::vertical_tabs::VerticalSidebarMode::Sessions,
+        );
+        let transferred_open = transferred_tab_workspace(
+            &mut app,
+            true,
+            super::vertical_tabs::VerticalSidebarMode::Tasks,
+        );
 
         transferred_closed.read(&app, |workspace, _| {
             assert!(!workspace.vertical_tabs_panel_open);
         });
         transferred_open.read(&app, |workspace, _| {
             assert!(workspace.vertical_tabs_panel_open);
+            assert_eq!(
+                workspace.vertical_tabs_panel.sidebar_mode(),
+                super::vertical_tabs::VerticalSidebarMode::Tasks
+            );
         });
     });
 }

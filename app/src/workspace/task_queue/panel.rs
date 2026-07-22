@@ -9,7 +9,8 @@ use warpui::platform::Cursor;
 use warpui::{AppContext, SingletonEntity};
 
 use super::{
-    AgentKind, Task, TaskId, TaskPriority, TaskQueueModel, TaskStatus, WorkspaceId, WorkspaceSource,
+    AgentKind, Task, TaskId, TaskLoadError, TaskPriority, TaskQueueModel, TaskStatus, WorkspaceId,
+    WorkspaceSource,
 };
 use crate::appearance::Appearance;
 use crate::workspace::action::WorkspaceAction;
@@ -81,6 +82,27 @@ pub(crate) fn tasks_for_selected_workspace<'a>(
         .iter()
         .filter(|task| &task.workspace_id == selected_workspace_id)
         .collect()
+}
+
+/// Produces concise, readable diagnostics without withholding valid tasks from
+/// the panel when some persisted task entries could not be loaded.
+pub(crate) fn task_queue_diagnostics(
+    load_errors: &[TaskLoadError],
+    store_load_error: Option<&str>,
+) -> Vec<String> {
+    let mut diagnostics =
+        Vec::with_capacity(load_errors.len() + usize::from(store_load_error.is_some()));
+    if let Some(error) = store_load_error {
+        diagnostics.push(format!("No se pudo cargar la cola de tareas: {error}"));
+    }
+    diagnostics.extend(load_errors.iter().map(|error| {
+        format!(
+            "No se pudo cargar {}: {}",
+            error.path.display(),
+            error.reason
+        )
+    }));
+    diagnostics
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -184,6 +206,12 @@ pub(crate) fn render_task_queue_panel(
         .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
         .with_spacing(TASK_SECTION_GAP);
 
+    if let Some(diagnostics) =
+        render_task_queue_diagnostics(queue.load_errors(), queue.store_load_error(), app)
+    {
+        content.add_child(diagnostics);
+    }
+
     content.add_child(render_workspace_selector(
         queue,
         selected_workspace_id,
@@ -256,6 +284,27 @@ pub(crate) fn render_task_queue_panel(
         .with_padding(Padding::uniform(8.))
         .with_background(internal_colors::fg_overlay_1(theme))
         .finish()
+}
+
+fn render_task_queue_diagnostics(
+    load_errors: &[TaskLoadError],
+    store_load_error: Option<&str>,
+    app: &AppContext,
+) -> Option<Box<dyn Element>> {
+    let diagnostics = task_queue_diagnostics(load_errors, store_load_error);
+    if diagnostics.is_empty() {
+        return None;
+    }
+
+    let mut section = Flex::column()
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+        .with_spacing(2.);
+    section.add_child(section_heading("Diagnóstico de tareas", app));
+    for diagnostic in diagnostics {
+        section.add_child(secondary_text(diagnostic, app));
+    }
+    Some(section.finish())
 }
 
 fn render_workspace_selector(
