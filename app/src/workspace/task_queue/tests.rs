@@ -469,6 +469,33 @@ fn successful_linked_command_is_persisted_as_review_required_without_a_session_l
 }
 
 #[test]
+fn manual_completion_is_persisted_before_the_model_exposes_done() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+    let created = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("task should persist");
+    let mut model = TaskQueueModel::new();
+    model
+        .load_from_store(&store)
+        .expect("task should load into the queue");
+    model
+        .require_linked_task_attention_with_store(&store, &created.id, "needs manual review")
+        .expect("attention transition should persist");
+
+    let completed = model
+        .mark_done_with_store(&store, &created.id)
+        .expect("manual completion should persist before the model is updated");
+
+    assert_eq!(completed.status, TaskStatus::Done);
+    assert_eq!(
+        store.list().expect("task should remain readable").tasks[0].status,
+        TaskStatus::Done
+    );
+}
+
+#[test]
 fn failed_launch_persistence_keeps_the_model_task_pending_and_unlinked() {
     let data = tempfile::tempdir().expect("data directory should be created");
     let workspace = tempfile::tempdir().expect("workspace should be created");
@@ -957,6 +984,23 @@ fn task_requires_explicit_review_before_completion() {
 }
 
 #[test]
+fn manual_completion_allows_an_attention_required_task() {
+    let workspace_id = super::WorkspaceId::new("workspace-1");
+    let mut task = Task::new(
+        TaskId::new("LOCAL-004"),
+        NewTaskInput::new(workspace_id, "Review the failed task")
+            .with_priority(TaskPriority::Normal),
+    );
+    task.mark_attention_required("The agent stopped unexpectedly")
+        .expect("a pending task can require attention");
+
+    task.mark_done()
+        .expect("manual completion should resolve an attention-required task");
+
+    assert_eq!(task.status, TaskStatus::Done);
+}
+
+#[test]
 fn pending_tasks_can_require_attention_and_retry_without_losing_the_reason_early() {
     let mut task = Task::new(
         TaskId::new("task-1"),
@@ -970,7 +1014,6 @@ fn pending_tasks_can_require_attention_and_retry_without_losing_the_reason_early
         task.attention_reason.as_deref(),
         Some("Workspace was unavailable")
     );
-    assert!(task.mark_done().is_err());
     assert!(task.mark_command_finished(true).is_err());
     assert_eq!(task.status, TaskStatus::AttentionRequired);
     assert_eq!(
@@ -1109,7 +1152,7 @@ fn unavailable_workspace_roots_remain_visible() {
 }
 
 #[test]
-fn invalid_task_transitions_preserve_attention_reason() {
+fn manual_completion_preserves_attention_reason_for_later_inspection() {
     let mut task = Task::new(
         TaskId::new("task-1"),
         NewTaskInput::new(super::WorkspaceId::new("workspace-1"), "Handle a failure"),
@@ -1121,8 +1164,9 @@ fn invalid_task_transitions_preserve_attention_reason() {
 
     assert_eq!(task.status, TaskStatus::AttentionRequired);
     let reason = task.attention_reason.clone();
-    assert!(task.mark_done().is_err());
-    assert_eq!(task.status, TaskStatus::AttentionRequired);
+    task.mark_done()
+        .expect("manual completion should be allowed after an attention state");
+    assert_eq!(task.status, TaskStatus::Done);
     assert_eq!(task.attention_reason, reason);
 }
 

@@ -528,6 +528,91 @@ fn linked_task_command_success_moves_only_that_task_to_review_required() {
 }
 
 #[test]
+fn opening_a_linked_task_session_focuses_only_the_explicit_task_terminal() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        let workspace = mock_workspace(&mut app);
+
+        let linked_tab_index = workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+            workspace.active_tab_index()
+        });
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            assert_ne!(workspace.active_tab_index(), linked_tab_index);
+            workspace.handle_action(
+                &WorkspaceAction::OpenLinkedTaskSession(task.id.clone()),
+                ctx,
+            );
+            assert_eq!(workspace.active_tab_index(), linked_tab_index);
+        });
+    });
+}
+
+#[test]
+fn marking_a_task_done_removes_only_its_explicit_session_link() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+        });
+        app.update(|ctx| {
+            TaskQueueModel::handle(ctx).update(ctx, |queue, ctx| {
+                queue
+                    .require_linked_task_attention_in_active_store(
+                        &task.id,
+                        "the terminal needs a manual resolution",
+                        ctx,
+                    )
+                    .expect("attention transition should persist");
+            });
+        });
+
+        workspace.update(&mut app, |workspace, ctx| {
+            let tab_count = workspace.tab_count();
+            assert!(
+                workspace
+                    .task_terminal_launches
+                    .values()
+                    .any(|linked_task_id| linked_task_id == &task.id)
+            );
+            workspace.handle_action(&WorkspaceAction::MarkTaskDone(task.id.clone()), ctx);
+            assert_eq!(workspace.tab_count(), tab_count);
+            assert!(
+                !workspace
+                    .task_terminal_launches
+                    .values()
+                    .any(|linked_task_id| linked_task_id == &task.id)
+            );
+        });
+        assert_eq!(task_from_queue(&app, &task.id).status, TaskStatus::Done);
+    });
+}
+
+#[test]
 fn linked_task_command_failure_moves_only_that_task_to_attention_required() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);

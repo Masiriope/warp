@@ -4,15 +4,22 @@ mod panel;
 mod storage;
 mod task_dialog;
 
-pub(crate) use command::{build_launch_command, shell_quote};
+pub(crate) use command::build_launch_command;
+#[cfg(test)]
+pub(crate) use command::shell_quote;
 pub(crate) use model::{
     AgentKind, DiscoveredWorkspace, NewTaskInput, Task, TaskAttachment, TaskId, TaskPriority,
     TaskQueueError, TaskQueueModel, TaskQueuePersistError, TaskStatus, TaskWorkspace, WorkspaceId,
     WorkspaceRoot, WorkspaceSource, default_sources,
 };
-pub(crate) use panel::{TaskPanelSelection, render_task_queue_panel};
+pub(crate) use panel::{
+    TaskPanelSelection, TaskSessionMetadata, TaskSessionRow, render_task_queue_panel,
+    task_session_group,
+};
 pub(crate) use storage::{TaskLoadError, TaskStore, TaskStoreError};
-pub(crate) use task_dialog::{TaskDialog, TaskDialogEvent, TaskDialogState};
+#[cfg(test)]
+pub(crate) use task_dialog::TaskDialogState;
+pub(crate) use task_dialog::{TaskDialog, TaskDialogEvent};
 
 #[cfg(test)]
 #[path = "tests.rs"]

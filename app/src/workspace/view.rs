@@ -2517,6 +2517,57 @@ impl Workspace {
         }
     }
 
+    /// Focuses the already-created terminal tab for a task queue launch. The
+    /// local launch map is the only authority: manually started terminals are
+    /// never searched or classified here.
+    fn open_linked_task_session(&mut self, task_id: &TaskId, ctx: &mut ViewContext<Self>) {
+        let Some(terminal_pane_id) =
+            self.task_terminal_launches
+                .iter()
+                .find_map(|(terminal_pane_id, linked_task_id)| {
+                    (linked_task_id == task_id).then(|| terminal_pane_id.clone())
+                })
+        else {
+            ctx.notify();
+            return;
+        };
+
+        let tab_index = self.tabs.iter().position(|tab| {
+            tab.pane_group
+                .as_ref(ctx)
+                .terminal_pane_ids()
+                .filter_map(|pane_id| pane_id.as_terminal_pane_id())
+                .any(|pane_id| pane_id == terminal_pane_id)
+        });
+        if let Some(tab_index) = tab_index {
+            self.activate_tab(tab_index, ctx);
+        } else {
+            // A stale link must not cause us to inspect or adopt a manual
+            // terminal. Close and exit paths will recover the task state.
+            ctx.notify();
+        }
+    }
+
+    fn mark_task_done(&mut self, task_id: &TaskId, ctx: &mut ViewContext<Self>) {
+        let result = TaskQueueModel::handle(ctx).update(ctx, |queue, ctx| {
+            queue.mark_done_in_active_store(task_id, ctx)
+        });
+        match result {
+            Ok(_) => {
+                // Completion is manual and does not close the terminal. It
+                // simply removes the explicit queue relationship, returning
+                // the session to the ordinary Warp list on the next render.
+                self.task_terminal_launches
+                    .retain(|_, linked_task_id| linked_task_id != task_id);
+                ctx.notify();
+            }
+            Err(error) => self.show_task_launch_error(
+                format!("No se pudo marcar la tarea como terminada: {error}"),
+                ctx,
+            ),
+        }
+    }
+
     fn add_task_terminal_tab(
         &mut self,
         workspace_path: PathBuf,
@@ -24551,11 +24602,8 @@ impl TypedActionView for Workspace {
                 ctx.notify();
             }
             LaunchTask { task_id, agent } => self.launch_task(task_id.clone(), *agent, ctx),
-            // A later task owns durable linked-session navigation. Do not
-            // classify manually started terminals as queue-linked sessions.
-            OpenLinkedTaskSession(_) => ctx.notify(),
-            // Task 7 owns the durable status transition and its storage write.
-            MarkTaskDone(_) => ctx.notify(),
+            OpenLinkedTaskSession(task_id) => self.open_linked_task_session(task_id, ctx),
+            MarkTaskDone(task_id) => self.mark_task_done(task_id, ctx),
             StartAgentOnboardingTutorial(tutorial) => {
                 self.start_agent_onboarding_tutorial(tutorial.clone(), ctx)
             }

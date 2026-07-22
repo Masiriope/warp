@@ -7,8 +7,8 @@ use super::model::{
     AgentKind, Task, TaskAttachment, TaskId, TaskPriority, TaskStatus, WorkspaceId,
 };
 use super::panel::{
-    TaskSessionRow, partition_task_linked_sessions, task_actions_for, task_presentation,
-    task_queue_diagnostics, tasks_for_selected_workspace,
+    TaskSessionMetadata, TaskSessionRow, partition_task_linked_sessions, task_actions_for,
+    task_presentation, task_queue_diagnostics, task_session_group, tasks_for_selected_workspace,
 };
 
 fn task(id: &str, workspace_id: &WorkspaceId, priority: TaskPriority, status: TaskStatus) -> Task {
@@ -85,6 +85,94 @@ fn session_partition_separates_explicitly_linked_tasks_without_changing_ordinary
     assert_eq!(partition.linked.len(), 1);
     assert_eq!(partition.linked[0].session, linked_path);
     assert_eq!(partition.linked[0].task_id, TaskId::new("linked-task"));
+}
+
+#[test]
+fn task_sessions_group_is_absent_when_no_linked_task_is_running() {
+    let ordinary_session = PathBuf::from("ordinary-session");
+    let sessions = vec![TaskSessionRow::ordinary(ordinary_session.clone())];
+
+    let (ordinary, task_group) = task_session_group(sessions, |_| None);
+
+    assert_eq!(ordinary, vec![ordinary_session]);
+    assert!(task_group.is_none());
+}
+
+#[test]
+fn task_sessions_group_uses_only_explicit_live_task_metadata() {
+    let ordinary_session = PathBuf::from("ordinary-session");
+    let linked_session = PathBuf::from("linked-session");
+    let linked_task_id = TaskId::new("LOCAL-004");
+    let stale_task_id = TaskId::new("stale-task");
+    let sessions = vec![
+        TaskSessionRow::ordinary(ordinary_session.clone()),
+        TaskSessionRow::linked(linked_session.clone(), linked_task_id.clone()),
+        TaskSessionRow::linked(PathBuf::from("stale-session"), stale_task_id),
+    ];
+
+    let (ordinary, task_group) = task_session_group(sessions, |task_id| {
+        (task_id == &linked_task_id).then(|| TaskSessionMetadata {
+            task_id: task_id.clone(),
+            title: "Revisar firmas".to_owned(),
+            priority_label: "Alta",
+            status_label: "En curso",
+            workspace_name: "MGA-Portal".to_owned(),
+        })
+    });
+
+    assert_eq!(
+        ordinary,
+        vec![ordinary_session, PathBuf::from("stale-session")]
+    );
+    let task_group = task_group.expect("a live explicit task should render its own group");
+    assert_eq!(task_group.rows.len(), 1);
+    assert_eq!(task_group.rows[0].session, linked_session);
+    assert_eq!(task_group.rows[0].metadata.title, "Revisar firmas");
+    assert_eq!(task_group.rows[0].metadata.priority_label, "Alta");
+    assert_eq!(task_group.rows[0].metadata.workspace_name, "MGA-Portal");
+}
+
+#[test]
+fn task_sessions_group_keeps_multiple_explicit_tasks_separate_from_manual_sessions() {
+    let first_task_id = TaskId::new("LOCAL-005");
+    let second_task_id = TaskId::new("LOCAL-006");
+    let manual_session = PathBuf::from("manually-started-codexauto");
+    let sessions = vec![
+        TaskSessionRow::linked(PathBuf::from("first-task-terminal"), first_task_id.clone()),
+        TaskSessionRow::ordinary(manual_session.clone()),
+        TaskSessionRow::linked(
+            PathBuf::from("second-task-terminal"),
+            second_task_id.clone(),
+        ),
+    ];
+
+    let (ordinary, task_group) = task_session_group(sessions, |task_id| {
+        if task_id == &first_task_id {
+            Some(TaskSessionMetadata {
+                task_id: task_id.clone(),
+                title: "Primera tarea".to_owned(),
+                priority_label: "Normal",
+                status_label: "En curso",
+                workspace_name: "MGA-Portal".to_owned(),
+            })
+        } else if task_id == &second_task_id {
+            Some(TaskSessionMetadata {
+                task_id: task_id.clone(),
+                title: "Segunda tarea".to_owned(),
+                priority_label: "Baja",
+                status_label: "En curso",
+                workspace_name: "warp".to_owned(),
+            })
+        } else {
+            None
+        }
+    });
+
+    assert_eq!(ordinary, vec![manual_session]);
+    let task_group = task_group.expect("both explicit tasks should remain grouped");
+    assert_eq!(task_group.rows.len(), 2);
+    assert_eq!(task_group.rows[0].metadata.task_id, first_task_id);
+    assert_eq!(task_group.rows[1].metadata.task_id, second_task_id);
 }
 
 #[test]

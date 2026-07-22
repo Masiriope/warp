@@ -355,10 +355,17 @@ impl Task {
     }
 
     pub(crate) fn mark_done(&mut self) -> Result<(), TaskQueueError> {
-        self.require_status(TaskStatus::ReviewRequired, "complete")?;
-        self.status = TaskStatus::Done;
-        self.touch();
-        Ok(())
+        match self.status {
+            TaskStatus::ReviewRequired | TaskStatus::AttentionRequired => {
+                self.status = TaskStatus::Done;
+                self.touch();
+                Ok(())
+            }
+            status => Err(TaskQueueError::InvalidTaskTransition {
+                action: "complete",
+                status,
+            }),
+        }
     }
 
     fn touch(&mut self) {
@@ -708,6 +715,16 @@ impl TaskQueueModel {
         self.update_task_with_store(store, task_id, |task| task.mark_attention_required(reason))
     }
 
+    /// Persists an explicit user completion before exposing the terminal task
+    /// as done in the in-memory queue.
+    pub(crate) fn mark_done_with_store(
+        &mut self,
+        store: &TaskStore,
+        task_id: &TaskId,
+    ) -> Result<Task, TaskQueuePersistError> {
+        self.update_task_with_store(store, task_id, Task::mark_done)
+    }
+
     pub(crate) fn launch_in_active_store(
         &mut self,
         task_id: &TaskId,
@@ -748,6 +765,17 @@ impl TaskQueueModel {
     ) -> Result<Task, TaskQueuePersistError> {
         let store = self.active_store();
         let task = self.require_linked_task_attention_with_store(&store, task_id, reason)?;
+        ctx.emit(TaskQueueEvent::Updated);
+        Ok(task)
+    }
+
+    pub(crate) fn mark_done_in_active_store(
+        &mut self,
+        task_id: &TaskId,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<Task, TaskQueuePersistError> {
+        let store = self.active_store();
+        let task = self.mark_done_with_store(&store, task_id)?;
         ctx.emit(TaskQueueEvent::Updated);
         Ok(task)
     }

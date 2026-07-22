@@ -77,7 +77,8 @@ use crate::workspace::tab_settings::{
     VerticalTabsPrimaryInfo, VerticalTabsTabItemMode, VerticalTabsViewMode,
 };
 use crate::workspace::task_queue::{
-    TaskId, TaskPanelSelection, WorkspaceId, render_task_queue_panel,
+    TaskId, TaskPanelSelection, TaskQueueModel, TaskSessionMetadata, TaskSessionRow, WorkspaceId,
+    render_task_queue_panel, task_session_group,
 };
 use crate::workspace::view::vertical_tabs::telemetry::{
     VerticalTabsChipEntrypoint, VerticalTabsTelemetryEvent,
@@ -2050,6 +2051,26 @@ fn render_groups(
         }
     }
 
+    let (visible_tabs, active_task_sessions) = task_session_group(
+        visible_tabs
+            .into_iter()
+            .map(|(tab_index, filtered_pane_ids)| {
+                let task_id = workspace
+                    .tabs
+                    .get(tab_index)
+                    .and_then(|tab| task_id_for_tab(workspace, tab, app));
+                TaskSessionRow {
+                    session: (tab_index, filtered_pane_ids),
+                    task_id,
+                }
+            }),
+        |task_id| {
+            TaskQueueModel::as_ref(app)
+                .task(task_id)
+                .map(TaskSessionMetadata::from)
+        },
+    );
+
     let is_any_pane_dragging = any_workspace_pane_being_dragged(workspace, app);
     // Ghost state for cross-window drag hovering over this window's vertical tabs panel.
     let ghost_state = CrossWindowTabDrag::as_ref(app).ghost_state_for_window(workspace.window_id);
@@ -2059,6 +2080,23 @@ fn render_groups(
         .with_cross_axis_alignment(CrossAxisAlignment::Stretch);
     if !uses_outer_group_container {
         groups = groups.with_spacing(TABS_MODE_ITEM_SPACING);
+    }
+
+    if let Some(task_sessions) = active_task_sessions {
+        groups.add_child(render_session_section_heading("Tareas en curso", app));
+        for task_session in task_sessions.rows {
+            let (tab_index, _) = task_session.session;
+            groups.add_child(
+                SavePosition::new(
+                    render_linked_task_session_row(&task_session.metadata, app),
+                    &tab_position_id(tab_index),
+                )
+                .finish(),
+            );
+        }
+        if !visible_tabs.is_empty() {
+            groups.add_child(render_session_section_heading("Sesiones", app));
+        }
     }
 
     // Consecutive tabs sharing a group_id collapse into a single group container.
@@ -2167,6 +2205,114 @@ fn render_groups(
             .with_padding(Padding::uniform(8.).with_top(0.))
             .finish()
     }
+}
+
+/// A task-session relationship is only valid while the current workspace owns
+/// the explicit `TerminalPaneId -> TaskId` entry created by a queue launch.
+/// We deliberately do not inspect the terminal title, command or process.
+fn task_id_for_tab(workspace: &Workspace, tab: &TabData, app: &AppContext) -> Option<TaskId> {
+    tab.pane_group
+        .as_ref(app)
+        .terminal_pane_ids()
+        .find_map(|pane_id| {
+            pane_id.as_terminal_pane_id().and_then(|terminal_pane_id| {
+                workspace
+                    .task_terminal_launches
+                    .get(&terminal_pane_id)
+                    .cloned()
+            })
+        })
+}
+
+fn render_session_section_heading(label: &'static str, app: &AppContext) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    Container::new(
+        Text::new_inline(label, appearance.ui_font_family(), 11.)
+            .with_color(theme.sub_text_color(theme.background()).into())
+            .finish(),
+    )
+    .with_padding(Padding::uniform(0.).with_horizontal(12.).with_vertical(8.))
+    .with_border(
+        Border::new(1.)
+            .with_sides(true, false, false, false)
+            .with_border_fill(internal_colors::fg_overlay_2(theme)),
+    )
+    .finish()
+}
+
+fn render_linked_task_session_row(
+    metadata: &TaskSessionMetadata,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let task_id = metadata.task_id.clone();
+    let workspace_suffix = (!metadata.workspace_name.is_empty())
+        .then(|| format!(" · {}", metadata.workspace_name))
+        .unwrap_or_default();
+    let detail = format!(
+        "{} · {} · {}{}",
+        metadata.task_id.0, metadata.priority_label, metadata.status_label, workspace_suffix
+    );
+    let title = metadata.title.clone();
+    let font_family = appearance.ui_font_family().to_owned();
+
+    Hoverable::new(MouseStateHandle::default(), move |hover_state| {
+        let row = Container::new(
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                .with_spacing(8.)
+                .with_child(
+                    ConstrainedBox::new(
+                        WarpIcon::Terminal
+                            .to_warpui_icon(theme.sub_text_color(theme.background()))
+                            .finish(),
+                    )
+                    .with_width(16.)
+                    .with_height(16.)
+                    .finish(),
+                )
+                .with_child(
+                    Shrinkable::new(
+                        1.,
+                        Flex::column()
+                            .with_main_axis_size(MainAxisSize::Min)
+                            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                            .with_spacing(2.)
+                            .with_child(
+                                Text::new_inline(title.clone(), font_family.clone(), 12.)
+                                    .with_clip(ClipConfig::ellipsis())
+                                    .with_color(theme.main_text_color(theme.background()).into())
+                                    .finish(),
+                            )
+                            .with_child(
+                                Text::new_inline(detail.clone(), font_family.clone(), 11.)
+                                    .with_clip(ClipConfig::ellipsis())
+                                    .with_color(theme.sub_text_color(theme.background()).into())
+                                    .finish(),
+                            )
+                            .finish(),
+                    )
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_padding(Padding::uniform(8.))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
+        if hover_state.is_hovered() {
+            row.with_background(internal_colors::fg_overlay_2(theme))
+                .finish()
+        } else {
+            row.finish()
+        }
+    })
+    .with_cursor(Cursor::PointingHand)
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(WorkspaceAction::OpenLinkedTaskSession(task_id.clone()));
+    })
+    .finish()
 }
 
 #[allow(clippy::too_many_arguments)]

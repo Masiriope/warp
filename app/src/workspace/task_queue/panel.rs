@@ -141,6 +141,46 @@ pub(crate) struct TaskSessionPartition<T> {
     pub(crate) linked: Vec<LinkedTaskSession<T>>,
 }
 
+/// Presentation data for an explicitly linked, currently running task session.
+/// It intentionally contains no agent identity: the task queue owns the task
+/// relationship and never infers one from the command or terminal process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TaskSessionMetadata {
+    pub(crate) task_id: TaskId,
+    pub(crate) title: String,
+    pub(crate) priority_label: &'static str,
+    pub(crate) status_label: &'static str,
+    pub(crate) workspace_name: String,
+}
+
+impl From<&Task> for TaskSessionMetadata {
+    fn from(task: &Task) -> Self {
+        let presentation = task_presentation(task.priority, task.status);
+        Self {
+            task_id: task.id.clone(),
+            title: task.title.clone(),
+            priority_label: presentation.priority_label,
+            status_label: presentation.status_label,
+            workspace_name: task
+                .workspace
+                .as_ref()
+                .map(|workspace| workspace.display_name.clone())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TaskSessionGroup<T> {
+    pub(crate) rows: Vec<TaskSessionGroupRow<T>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TaskSessionGroupRow<T> {
+    pub(crate) session: T,
+    pub(crate) metadata: TaskSessionMetadata,
+}
+
 /// Only explicit task metadata participates in this partition. Ordinary Warp
 /// sessions remain ordinary rows; this helper intentionally does not infer an
 /// agent or task relationship from a terminal title, command, or process.
@@ -159,6 +199,28 @@ pub(crate) fn partition_task_linked_sessions<T>(
         }
     }
     TaskSessionPartition { ordinary, linked }
+}
+
+/// Splits normal sessions from the temporary task group using only the
+/// explicit `TerminalPaneId -> TaskId` relationship supplied by the owning
+/// workspace. A missing task means the relationship is stale, so that session
+/// returns to the ordinary list rather than being classified from its command.
+pub(crate) fn task_session_group<T>(
+    sessions: impl IntoIterator<Item = TaskSessionRow<T>>,
+    task_for_id: impl Fn(&TaskId) -> Option<TaskSessionMetadata>,
+) -> (Vec<T>, Option<TaskSessionGroup<T>>) {
+    let mut ordinary = Vec::new();
+    let mut rows = Vec::new();
+    for session in sessions {
+        let TaskSessionRow { session, task_id } = session;
+        if let Some(metadata) = task_id.as_ref().and_then(|task_id| task_for_id(task_id)) {
+            rows.push(TaskSessionGroupRow { session, metadata });
+        } else {
+            ordinary.push(session);
+        }
+    }
+    let task_group = (!rows.is_empty()).then_some(TaskSessionGroup { rows });
+    (ordinary, task_group)
 }
 
 #[derive(Clone, Debug)]
@@ -483,37 +545,43 @@ fn render_task_detail(
     }
     detail.add_child(attachments.finish());
 
-    let mut buttons = Flex::row()
-        .with_main_axis_size(MainAxisSize::Max)
-        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-        .with_spacing(4.);
-    buttons.add_child(
-        Shrinkable::new(
-            1.,
-            task_action_button(
-                "Abrir con Codex",
-                actions.launch_codex,
-                true,
-                workspace_is_available,
-                app,
-            ),
-        )
-        .finish(),
+    let can_launch = matches!(
+        task.status,
+        TaskStatus::Pending | TaskStatus::AttentionRequired
     );
-    buttons.add_child(
-        Shrinkable::new(
-            1.,
-            task_action_button(
-                "Abrir con Claude Code",
-                actions.launch_claude_code,
-                false,
-                workspace_is_available,
-                app,
-            ),
-        )
-        .finish(),
-    );
-    detail.add_child(buttons.finish());
+    if can_launch {
+        let mut buttons = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(4.);
+        buttons.add_child(
+            Shrinkable::new(
+                1.,
+                task_action_button(
+                    "Abrir con Codex",
+                    actions.launch_codex,
+                    true,
+                    workspace_is_available,
+                    app,
+                ),
+            )
+            .finish(),
+        );
+        buttons.add_child(
+            Shrinkable::new(
+                1.,
+                task_action_button(
+                    "Abrir con Claude Code",
+                    actions.launch_claude_code,
+                    false,
+                    workspace_is_available,
+                    app,
+                ),
+            )
+            .finish(),
+        );
+        detail.add_child(buttons.finish());
+    }
 
     if task.terminal_pane_id.is_some() {
         detail.add_child(task_action_button(
@@ -524,9 +592,12 @@ fn render_task_detail(
             app,
         ));
     }
-    if task.status == TaskStatus::ReviewRequired {
+    if matches!(
+        task.status,
+        TaskStatus::ReviewRequired | TaskStatus::AttentionRequired
+    ) {
         detail.add_child(task_action_button(
-            "Marcar terminada",
+            "Marcar como hecha",
             actions.mark_done,
             false,
             true,
