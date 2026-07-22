@@ -20,6 +20,7 @@ pub mod rewind_confirmation_dialog;
 pub mod sync_inputs;
 pub mod tab_group;
 pub mod tab_settings;
+mod task_queue;
 mod toast_stack;
 pub mod util;
 pub mod view;
@@ -61,6 +62,13 @@ pub fn panel_header_corner_radius() -> warpui::elements::CornerRadius {
 
 pub use one_time_modal_model::OneTimeModalModel;
 pub use registry::WorkspaceRegistry;
+#[allow(unused_imports)]
+// Re-exported for workspace modules added in subsequent task-queue work.
+pub(crate) use task_queue::{
+    AgentKind, DiscoveredWorkspace, NewTaskInput, Task, TaskAttachment, TaskId, TaskPriority,
+    TaskQueueError, TaskQueueModel, TaskStatus, WorkspaceId, WorkspaceRoot, WorkspaceSource,
+    default_sources,
+};
 pub use toast_stack::ToastStack;
 
 use crate::workspace::view::{
@@ -76,6 +84,7 @@ use crate::workspace::view::{
 
 pub fn init(app: &mut AppContext) {
     app.add_singleton_model(|_| WorkspaceRegistry::new());
+    app.add_singleton_model(|_| TaskQueueModel::new());
     app.add_singleton_model(|_| cross_window_tab_drag::CrossWindowTabDrag::new());
     use warpui::keymap::macros::*;
     app.register_binding_validator::<Workspace>(is_binding_pty_compliant);

@@ -1,0 +1,462 @@
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use warpui::{Entity, SingletonEntity};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) enum TaskStatus {
+    Pending,
+    InProgress,
+    ReviewRequired,
+    AttentionRequired,
+    Done,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) enum TaskPriority {
+    High,
+    #[default]
+    Normal,
+    Low,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) enum AgentKind {
+    #[default]
+    Codex,
+    ClaudeCode,
+}
+
+impl AgentKind {
+    pub(crate) const fn wrapper_name(self) -> &'static str {
+        match self {
+            Self::Codex => "codexauto",
+            Self::ClaudeCode => "claudeauto",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub(crate) enum WorkspaceSource {
+    Github,
+    ActiveProjects,
+}
+
+impl WorkspaceSource {
+    const fn display_name(self) -> &'static str {
+        match self {
+            Self::Github => "GitHub",
+            Self::ActiveProjects => "Active Projects",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct WorkspaceRoot {
+    pub(crate) source: WorkspaceSource,
+    pub(crate) path: PathBuf,
+}
+
+impl WorkspaceRoot {
+    pub(crate) fn new(source: WorkspaceSource, path: impl Into<PathBuf>) -> Self {
+        Self {
+            source,
+            path: path.into(),
+        }
+    }
+}
+
+pub(crate) fn default_sources(home: impl AsRef<Path>) -> Vec<WorkspaceRoot> {
+    let home = home.as_ref();
+    vec![
+        WorkspaceRoot::new(WorkspaceSource::Github, home.join("Documents/GitHub")),
+        WorkspaceRoot::new(
+            WorkspaceSource::ActiveProjects,
+            home.join("Desktop/01_Proyectos_Activos"),
+        ),
+    ]
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub(crate) struct WorkspaceId(pub(crate) String);
+
+impl WorkspaceId {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    fn from_path(path: &Path) -> Self {
+        let normalized = normalize_path(path);
+        let digest = Sha256::digest(normalized.to_string_lossy().as_bytes());
+        Self(format!("{digest:x}"))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub(crate) struct TaskId(pub(crate) String);
+
+impl TaskId {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct TaskAttachment {
+    pub(crate) path: PathBuf,
+}
+
+impl TaskAttachment {
+    pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct NewTaskInput {
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) title: String,
+    pub(crate) description: String,
+    pub(crate) priority: TaskPriority,
+    pub(crate) agent_kind: AgentKind,
+    pub(crate) attachments: Vec<TaskAttachment>,
+}
+
+impl NewTaskInput {
+    pub(crate) fn new(workspace_id: WorkspaceId, title: impl Into<String>) -> Self {
+        Self {
+            workspace_id,
+            title: title.into(),
+            description: String::new(),
+            priority: TaskPriority::Normal,
+            agent_kind: AgentKind::Codex,
+            attachments: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    pub(crate) fn with_priority(mut self, priority: TaskPriority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    pub(crate) fn with_agent_kind(mut self, agent_kind: AgentKind) -> Self {
+        self.agent_kind = agent_kind;
+        self
+    }
+
+    pub(crate) fn with_attachments(mut self, attachments: Vec<TaskAttachment>) -> Self {
+        self.attachments = attachments;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct Task {
+    pub(crate) id: TaskId,
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) title: String,
+    pub(crate) description: String,
+    pub(crate) priority: TaskPriority,
+    pub(crate) agent_kind: AgentKind,
+    pub(crate) attachments: Vec<TaskAttachment>,
+    pub(crate) status: TaskStatus,
+    pub(crate) terminal_pane_id: Option<String>,
+    pub(crate) attention_reason: Option<String>,
+}
+
+impl Task {
+    pub(crate) fn new(id: TaskId, input: NewTaskInput) -> Self {
+        Self {
+            id,
+            workspace_id: input.workspace_id,
+            title: input.title,
+            description: input.description,
+            priority: input.priority,
+            agent_kind: input.agent_kind,
+            attachments: input.attachments,
+            status: TaskStatus::Pending,
+            terminal_pane_id: None,
+            attention_reason: None,
+        }
+    }
+
+    pub(crate) fn mark_launched(
+        &mut self,
+        terminal_pane_id: impl Into<String>,
+    ) -> Result<(), TaskQueueError> {
+        self.require_status(TaskStatus::Pending, "launch")?;
+        self.terminal_pane_id = Some(terminal_pane_id.into());
+        self.status = TaskStatus::InProgress;
+        Ok(())
+    }
+
+    pub(crate) fn mark_command_finished(&mut self, success: bool) -> Result<(), TaskQueueError> {
+        self.require_status(TaskStatus::InProgress, "record command completion")?;
+        if success {
+            self.status = TaskStatus::ReviewRequired;
+            self.attention_reason = None;
+        } else {
+            self.status = TaskStatus::AttentionRequired;
+            self.attention_reason = Some("The command did not complete successfully.".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_attention_required(
+        &mut self,
+        reason: impl Into<String>,
+    ) -> Result<(), TaskQueueError> {
+        match self.status {
+            TaskStatus::InProgress | TaskStatus::ReviewRequired => {
+                self.status = TaskStatus::AttentionRequired;
+                self.attention_reason = Some(reason.into());
+                Ok(())
+            }
+            status => Err(TaskQueueError::InvalidTaskTransition {
+                action: "require attention",
+                status,
+            }),
+        }
+    }
+
+    pub(crate) fn mark_done(&mut self) -> Result<(), TaskQueueError> {
+        self.require_status(TaskStatus::ReviewRequired, "complete")?;
+        self.status = TaskStatus::Done;
+        Ok(())
+    }
+
+    fn require_status(
+        &self,
+        expected: TaskStatus,
+        action: &'static str,
+    ) -> Result<(), TaskQueueError> {
+        if self.status == expected {
+            Ok(())
+        } else {
+            Err(TaskQueueError::InvalidTaskTransition {
+                action,
+                status: self.status,
+            })
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct DiscoveredWorkspace {
+    pub(crate) id: WorkspaceId,
+    pub(crate) source: WorkspaceSource,
+    pub(crate) path: PathBuf,
+    pub(crate) display_name: String,
+    pub(crate) is_available: bool,
+}
+
+impl DiscoveredWorkspace {
+    fn available(source: WorkspaceSource, path: PathBuf) -> Self {
+        let display_name = path_display_name(&path, source);
+        Self {
+            id: WorkspaceId::from_path(&path),
+            source,
+            path,
+            display_name,
+            is_available: true,
+        }
+    }
+
+    fn unavailable(source: WorkspaceSource, path: PathBuf) -> Self {
+        let display_name = path_display_name(&path, source);
+        Self {
+            id: WorkspaceId::from_path(&path),
+            source,
+            path,
+            display_name,
+            is_available: false,
+        }
+    }
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub(crate) enum TaskQueueError {
+    #[error("cannot {action} a task in {status:?} status")]
+    InvalidTaskTransition {
+        action: &'static str,
+        status: TaskStatus,
+    },
+    #[error("workspace {0:?} is not discovered")]
+    WorkspaceNotFound(WorkspaceId),
+    #[error("task {0:?} is not in the queue")]
+    TaskNotFound(TaskId),
+}
+
+#[derive(Default)]
+pub(crate) struct TaskQueueModel {
+    sources: Vec<WorkspaceRoot>,
+    workspaces: Vec<DiscoveredWorkspace>,
+    tasks: HashMap<TaskId, Task>,
+    selected_workspace_id: Option<WorkspaceId>,
+    selected_task_id: Option<TaskId>,
+}
+
+impl TaskQueueModel {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn discover(&mut self, sources: Vec<WorkspaceRoot>) {
+        self.workspaces = discover_workspaces(&sources);
+        self.sources = sources;
+        if self
+            .selected_workspace_id
+            .as_ref()
+            .is_some_and(|id| !self.workspaces.iter().any(|workspace| &workspace.id == id))
+        {
+            self.selected_workspace_id = None;
+        }
+    }
+
+    pub(crate) fn sources(&self) -> &[WorkspaceRoot] {
+        &self.sources
+    }
+
+    pub(crate) fn workspaces(&self) -> &[DiscoveredWorkspace] {
+        &self.workspaces
+    }
+
+    pub(crate) fn workspaces_for_source(
+        &self,
+        source: WorkspaceSource,
+    ) -> Vec<&DiscoveredWorkspace> {
+        self.workspaces
+            .iter()
+            .filter(|workspace| workspace.source == source)
+            .collect()
+    }
+
+    pub(crate) fn select_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+    ) -> Result<(), TaskQueueError> {
+        if self
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == workspace_id)
+        {
+            self.selected_workspace_id = Some(workspace_id);
+            Ok(())
+        } else {
+            Err(TaskQueueError::WorkspaceNotFound(workspace_id))
+        }
+    }
+
+    pub(crate) fn selected_workspace_id(&self) -> Option<&WorkspaceId> {
+        self.selected_workspace_id.as_ref()
+    }
+
+    pub(crate) fn insert_task(&mut self, task: Task) {
+        self.tasks.insert(task.id.clone(), task);
+    }
+
+    pub(crate) fn task(&self, task_id: &TaskId) -> Option<&Task> {
+        self.tasks.get(task_id)
+    }
+
+    pub(crate) fn tasks_for_workspace(&self, workspace_id: &WorkspaceId) -> Vec<&Task> {
+        self.tasks
+            .values()
+            .filter(|task| &task.workspace_id == workspace_id)
+            .collect()
+    }
+
+    pub(crate) fn select_task(&mut self, task_id: TaskId) -> Result<(), TaskQueueError> {
+        if self.tasks.contains_key(&task_id) {
+            self.selected_task_id = Some(task_id);
+            Ok(())
+        } else {
+            Err(TaskQueueError::TaskNotFound(task_id))
+        }
+    }
+
+    pub(crate) fn selected_task_id(&self) -> Option<&TaskId> {
+        self.selected_task_id.as_ref()
+    }
+}
+
+impl Entity for TaskQueueModel {
+    type Event = ();
+}
+
+impl SingletonEntity for TaskQueueModel {}
+
+fn discover_workspaces(sources: &[WorkspaceRoot]) -> Vec<DiscoveredWorkspace> {
+    let mut workspaces = Vec::new();
+
+    for source in sources {
+        let mut source_workspaces = match fs::read_dir(&source.path) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    entry
+                        .file_type()
+                        .ok()
+                        .filter(|file_type| file_type.is_dir())
+                        .map(|_| entry.path())
+                })
+                .map(|path| match path.canonicalize() {
+                    Ok(path) => DiscoveredWorkspace::available(source.source, path),
+                    Err(_) => DiscoveredWorkspace::unavailable(source.source, path),
+                })
+                .collect(),
+            Err(_) => vec![DiscoveredWorkspace::unavailable(
+                source.source,
+                source.path.clone(),
+            )],
+        };
+
+        source_workspaces.sort_by(|left, right| {
+            left.display_name
+                .to_lowercase()
+                .cmp(&right.display_name.to_lowercase())
+                .then_with(|| normalize_path(&left.path).cmp(&normalize_path(&right.path)))
+        });
+        workspaces.extend(source_workspaces);
+    }
+
+    workspaces
+}
+
+fn path_display_name(path: &Path, source: WorkspaceSource) -> String {
+    path.file_name()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| OsStr::new(source.display_name()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() && !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(component) => normalized.push(component),
+        }
+    }
+
+    normalized
+}
