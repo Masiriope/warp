@@ -397,10 +397,10 @@ impl Entity for TaskQueueModel {
 impl SingletonEntity for TaskQueueModel {}
 
 fn discover_workspaces(sources: &[WorkspaceRoot]) -> Vec<DiscoveredWorkspace> {
-    let mut workspaces = Vec::new();
+    let mut workspaces_by_source = Vec::<(WorkspaceSource, Vec<DiscoveredWorkspace>)>::new();
 
     for source in sources {
-        let mut source_workspaces = match fs::read_dir(&source.path) {
+        let source_workspaces = match fs::read_dir(&source.path) {
             Ok(entries) => entries
                 .filter_map(Result::ok)
                 .filter_map(|entry| {
@@ -421,16 +421,28 @@ fn discover_workspaces(sources: &[WorkspaceRoot]) -> Vec<DiscoveredWorkspace> {
             )],
         };
 
-        source_workspaces.sort_by(|left, right| {
-            left.display_name
-                .to_lowercase()
-                .cmp(&right.display_name.to_lowercase())
-                .then_with(|| normalize_path(&left.path).cmp(&normalize_path(&right.path)))
-        });
-        workspaces.extend(source_workspaces);
+        if let Some((_, workspaces)) = workspaces_by_source
+            .iter_mut()
+            .find(|(workspace_source, _)| *workspace_source == source.source)
+        {
+            workspaces.extend(source_workspaces);
+        } else {
+            workspaces_by_source.push((source.source, source_workspaces));
+        }
     }
 
-    workspaces
+    workspaces_by_source
+        .into_iter()
+        .flat_map(|(_, mut source_workspaces)| {
+            source_workspaces.sort_by(|left, right| {
+                left.display_name
+                    .to_lowercase()
+                    .cmp(&right.display_name.to_lowercase())
+                    .then_with(|| normalize_path(&left.path).cmp(&normalize_path(&right.path)))
+            });
+            source_workspaces
+        })
+        .collect()
 }
 
 fn path_display_name(path: &Path, source: WorkspaceSource) -> String {

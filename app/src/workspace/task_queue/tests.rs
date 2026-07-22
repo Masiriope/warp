@@ -85,6 +85,67 @@ fn discovery_sorts_case_insensitively_and_ids_include_the_path() {
 }
 
 #[test]
+fn workspaces_with_matching_display_names_have_distinct_path_ids() {
+    let home = tempfile::tempdir().expect("home directory should be created");
+    let github = home.path().join("Documents/GitHub");
+    let active_projects = home.path().join("Desktop/01_Proyectos_Activos");
+    fs::create_dir_all(github.join("Shared")).expect("github workspace should be created");
+    fs::create_dir_all(active_projects.join("Shared"))
+        .expect("active project workspace should be created");
+
+    let mut model = TaskQueueModel::new();
+    model.discover(default_sources(home.path()));
+
+    let github_workspace = &model.workspaces_for_source(WorkspaceSource::Github)[0];
+    let active_workspace = &model.workspaces_for_source(WorkspaceSource::ActiveProjects)[0];
+    assert_eq!(github_workspace.display_name, "Shared");
+    assert_eq!(active_workspace.display_name, "Shared");
+    assert_ne!(github_workspace.id, active_workspace.id);
+}
+
+#[test]
+fn discovery_uses_path_tiebreakers_for_case_insensitive_equal_names() {
+    let roots = tempfile::tempdir().expect("workspace roots should be created");
+    let alpha_root = roots.path().join("a-root");
+    let zebra_root = roots.path().join("m-root");
+    let uppercase_alpha_root = roots.path().join("z-root");
+    let lowercase_alpha = alpha_root.join("alpha");
+    let zebra = zebra_root.join("Zebra");
+    let uppercase_alpha = uppercase_alpha_root.join("Alpha");
+    fs::create_dir_all(&lowercase_alpha).expect("workspace should be created");
+    fs::create_dir_all(&zebra).expect("workspace should be created");
+    fs::create_dir_all(&uppercase_alpha).expect("workspace should be created");
+
+    let mut model = TaskQueueModel::new();
+    model.discover(vec![
+        WorkspaceRoot::new(WorkspaceSource::Github, uppercase_alpha_root),
+        WorkspaceRoot::new(WorkspaceSource::Github, zebra_root),
+        WorkspaceRoot::new(WorkspaceSource::Github, alpha_root),
+    ]);
+
+    let workspaces = model.workspaces_for_source(WorkspaceSource::Github);
+    assert_eq!(
+        workspaces
+            .iter()
+            .map(|workspace| workspace.display_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "Alpha", "Zebra"]
+    );
+    assert_eq!(
+        workspaces[0].path,
+        lowercase_alpha
+            .canonicalize()
+            .expect("workspace path should canonicalize")
+    );
+    assert_eq!(
+        workspaces[1].path,
+        uppercase_alpha
+            .canonicalize()
+            .expect("workspace path should canonicalize")
+    );
+}
+
+#[test]
 fn unavailable_workspace_roots_remain_visible() {
     let unavailable = tempfile::tempdir()
         .expect("temporary directory should be created")
