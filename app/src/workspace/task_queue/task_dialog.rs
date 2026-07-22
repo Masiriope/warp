@@ -995,6 +995,8 @@ fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     // most MAX_ATTACHMENT_BYTES and never decodes a frame.
     let mut offset = 12;
     let mut dimensions = None;
+    let mut extended_still_image = false;
+    let mut saw_extended_image_data = false;
     while offset < riff_end {
         let chunk_header_end = offset.checked_add(8)?;
         if chunk_header_end > riff_end {
@@ -1016,16 +1018,29 @@ fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         }
 
         if offset == 12 {
+            extended_still_image = chunk_type == b"VP8X";
             dimensions =
-                webp_first_chunk_dimensions(chunk_type, &bytes[chunk_data_start..chunk_data_end]);
+                webp_chunk_dimensions(chunk_type, &bytes[chunk_data_start..chunk_data_end]);
+        } else if extended_still_image
+            && matches!(chunk_type, b"VP8 " | b"VP8L")
+            && webp_chunk_dimensions(chunk_type, &bytes[chunk_data_start..chunk_data_end]).is_some()
+        {
+            // A nonanimated VP8X canvas is not itself image data. Require a
+            // bounded, structurally valid still-image chunk before allowing
+            // the container to reach the preview decoder.
+            saw_extended_image_data = true;
         }
         offset = padded_chunk_end;
     }
 
-    dimensions
+    if extended_still_image && !saw_extended_image_data {
+        None
+    } else {
+        dimensions
+    }
 }
 
-fn webp_first_chunk_dimensions(chunk_type: &[u8], chunk_data: &[u8]) -> Option<(u32, u32)> {
+fn webp_chunk_dimensions(chunk_type: &[u8], chunk_data: &[u8]) -> Option<(u32, u32)> {
     match chunk_type {
         b"VP8X" if chunk_data.len() == 10 => {
             // In the WebP VP8X feature byte, the Animation (A) flag is bit 6

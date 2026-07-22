@@ -142,23 +142,31 @@ fn rejects_animated_or_vector_and_malformed_image_payloads() {
 }
 
 #[test]
-fn vp8x_animation_flag_is_rejected_without_decoding_frames() {
+fn extended_webp_requires_a_still_image_chunk_and_rejects_animation_without_decoding() {
     let mut state = TaskDialogState::default();
 
+    assert_eq!(
+        state
+            .add_pasted_image("image/webp", vp8x_header(false))
+            .expect_err("a VP8X canvas without VP8 or VP8L data is truncated"),
+        "The pasted image has an invalid or unsupported header."
+    );
+    assert!(state.attachments().is_empty());
+
     state
-        .add_pasted_image("image/webp", vp8x_header(false))
-        .expect("a still VP8X header under the image budget should be accepted");
+        .add_pasted_image("image/webp", vp8x_with_structural_vp8_chunk(false))
+        .expect("a structurally complete still extended WebP should be accepted without decoding");
     assert_eq!(state.attachments().len(), 1);
 
     assert_eq!(
         state
-            .add_pasted_image("image/webp", vp8x_header(true))
+            .add_pasted_image("image/webp", vp8x_with_structural_vp8_chunk(true))
             .expect_err("animated VP8X images must not reach preview decoding"),
         "The pasted image has an invalid or unsupported header."
     );
     assert_eq!(state.attachments().len(), 1);
 
-    let mut trailing_data = vp8x_header(false);
+    let mut trailing_data = vp8x_with_structural_vp8_chunk(false);
     trailing_data.push(0);
     assert!(state.add_pasted_image("image/webp", trailing_data).is_err());
     assert_eq!(state.attachments().len(), 1);
@@ -249,5 +257,17 @@ fn vp8x_header(animated: bool) -> Vec<u8> {
     bytes.extend_from_slice(&[0, 0, 0]); // reserved bits
     bytes.extend_from_slice(&[1, 0, 0]); // canvas width: 2
     bytes.extend_from_slice(&[2, 0, 0]); // canvas height: 3
+    bytes
+}
+
+/// Structurally complete but intentionally not full-decodeable VP8 payload:
+/// it supplies a valid VP8 frame header (including dimensions) but no frame
+/// body. Header validation must accept this container without decoding it.
+fn vp8x_with_structural_vp8_chunk(animated: bool) -> Vec<u8> {
+    let mut bytes = vp8x_header(animated);
+    // RIFF File Size is bytes after offset 8: WEBP + VP8X + VP8 chunks.
+    bytes[4..8].copy_from_slice(&40_u32.to_le_bytes());
+    bytes.extend_from_slice(b"VP8 \x0a\0\0\0");
+    bytes.extend_from_slice(b"\0\0\0\x9d\x01\x2a\x02\0\x03\0");
     bytes
 }
