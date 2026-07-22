@@ -157,6 +157,13 @@ impl TaskDialogState {
         self.workspace_id.is_some() && !self.title.trim().is_empty()
     }
 
+    /// Builds an event payload while retaining the draft until Workspace has
+    /// persisted it and closes the dialog. Attachments contain Arc<[u8]>, so
+    /// this clones handles and metadata but never the clipboard image bytes.
+    pub(crate) fn new_task_input_for_submission(&self) -> Result<NewTaskInput, &'static str> {
+        self.clone().into_new_task_input()
+    }
+
     pub(crate) fn into_new_task_input(self) -> Result<NewTaskInput, &'static str> {
         let Some(workspace_id) = self.workspace_id else {
             return Err("Select a workspace before creating a task.");
@@ -800,16 +807,15 @@ impl TypedActionView for TaskDialog {
                     return;
                 }
 
-                // Move state into the event rather than cloning every pasted
-                // image buffer on submit. Workspace's event boundary may clone
-                // the input, but attachments carry Arc<[u8]> and remain shared.
-                let state = std::mem::take(&mut self.state);
-                match state.into_new_task_input() {
+                // Keep the draft until Workspace successfully persists and
+                // closes the modal. The submission clones only Arc handles,
+                // never the raw clipboard bytes, so a storage failure can be
+                // retried without losing title, context, or attachments.
+                match self.state.new_task_input_for_submission() {
                     Ok(input) => ctx.emit(TaskDialogEvent::Submitted(input)),
                     Err(error) => {
                         // `can_submit` checked the same invariants above. This
-                        // is retained for future validation additions without
-                        // silently dropping the user's draft.
+                        // is retained for future validation additions.
                         self.paste_error = Some(error.to_owned());
                         self.sync_submit_button(ctx);
                         ctx.notify();
@@ -860,13 +866,60 @@ fn validate_raster_image_header(mime_type: &str, bytes: &[u8]) -> Result<(), &'s
 
 fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
-    if bytes.len() < 24 || !bytes.starts_with(PNG_SIGNATURE) || &bytes[12..16] != b"IHDR" {
+    if !bytes.starts_with(PNG_SIGNATURE) {
         return None;
     }
-    Some((
-        u32::from_be_bytes(bytes[16..20].try_into().ok()?),
-        u32::from_be_bytes(bytes[20..24].try_into().ok()?),
-    ))
+
+    // This walks container chunks only (at most the compressed-byte cap), not
+    // image data. A complete PNG must have a first IHDR, at least one IDAT,
+    // and a terminal IEND chunk before it can reach the preview decoder.
+    let mut offset = PNG_SIGNATURE.len();
+    let mut dimensions = None;
+    let mut saw_idat = false;
+    while offset < bytes.len() {
+        let chunk_header_end = offset.checked_add(8)?;
+        if chunk_header_end > bytes.len() {
+            return None;
+        }
+        let chunk_length = usize::try_from(u32::from_be_bytes(
+            bytes[offset..offset + 4].try_into().ok()?,
+        ))
+        .ok()?;
+        let chunk_type = &bytes[offset + 4..chunk_header_end];
+        let chunk_data_start = chunk_header_end;
+        let chunk_data_end = chunk_data_start.checked_add(chunk_length)?;
+        let chunk_end = chunk_data_end.checked_add(4)?; // trailing CRC
+        if chunk_end > bytes.len() {
+            return None;
+        }
+
+        match chunk_type {
+            b"IHDR"
+                if offset == PNG_SIGNATURE.len() && dimensions.is_none() && chunk_length == 13 =>
+            {
+                dimensions = Some((
+                    u32::from_be_bytes(
+                        bytes[chunk_data_start..chunk_data_start + 4]
+                            .try_into()
+                            .ok()?,
+                    ),
+                    u32::from_be_bytes(
+                        bytes[chunk_data_start + 4..chunk_data_start + 8]
+                            .try_into()
+                            .ok()?,
+                    ),
+                ));
+            }
+            b"IDAT" if dimensions.is_some() => saw_idat = true,
+            b"IEND" if dimensions.is_some() && saw_idat && chunk_length == 0 => {
+                return (chunk_end == bytes.len()).then_some(dimensions?);
+            }
+            _ if dimensions.is_none() => return None,
+            _ => {}
+        }
+        offset = chunk_end;
+    }
+    None
 }
 
 fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -875,6 +928,7 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     }
 
     let mut index = 2;
+    let mut dimensions = None;
     while index < bytes.len() {
         while index < bytes.len() && bytes[index] == 0xff {
             index += 1;
@@ -884,7 +938,7 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 
         match marker {
             0x01 | 0xd0..=0xd7 => continue,
-            0xd9 | 0xda => return None,
+            0xd9 => return None,
             _ => {}
         }
 
@@ -895,13 +949,24 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         if segment_length < 2 || index.checked_add(segment_length)? > bytes.len() {
             return None;
         }
+        if marker == 0xda {
+            // Scan the bounded compressed payload only for the JPEG EOI
+            // marker. This checks structural completion without decoding a
+            // frame or expanding any image data.
+            let scan_data_start = index + segment_length;
+            return dimensions.filter(|_| {
+                bytes[scan_data_start..]
+                    .windows(2)
+                    .any(|marker| marker == [0xff, 0xd9])
+            });
+        }
         if is_jpeg_start_of_frame(marker) {
-            if segment_length < 8 {
+            if dimensions.is_some() || segment_length < 8 {
                 return None;
             }
             let height = u32::from(u16::from_be_bytes([bytes[index + 3], bytes[index + 4]]));
             let width = u32::from(u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]));
-            return Some((width, height));
+            dimensions = Some((width, height));
         }
         index += segment_length;
     }
@@ -920,31 +985,72 @@ fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         return None;
     }
     let riff_length = usize::try_from(u32::from_le_bytes(bytes[4..8].try_into().ok()?)).ok()?;
-    if riff_length.checked_add(8)? > bytes.len() {
+    let riff_end = riff_length.checked_add(8)?;
+    if riff_end != bytes.len() {
         return None;
     }
 
-    let chunk_length = usize::try_from(u32::from_le_bytes(bytes[16..20].try_into().ok()?)).ok()?;
-    if chunk_length > bytes.len().checked_sub(20)? {
-        return None;
+    // Validate every RIFF chunk's declared payload and mandatory alignment so
+    // a short container cannot make it to an image decoder. This walks at
+    // most MAX_ATTACHMENT_BYTES and never decodes a frame.
+    let mut offset = 12;
+    let mut dimensions = None;
+    while offset < riff_end {
+        let chunk_header_end = offset.checked_add(8)?;
+        if chunk_header_end > riff_end {
+            return None;
+        }
+        let chunk_type = &bytes[offset..offset + 4];
+        let chunk_length = usize::try_from(u32::from_le_bytes(
+            bytes[offset + 4..chunk_header_end].try_into().ok()?,
+        ))
+        .ok()?;
+        let chunk_data_start = chunk_header_end;
+        let chunk_data_end = chunk_data_start.checked_add(chunk_length)?;
+        if chunk_data_end > riff_end {
+            return None;
+        }
+        let padded_chunk_end = chunk_data_end.checked_add(chunk_length & 1)?;
+        if padded_chunk_end > riff_end || (chunk_length & 1 == 1 && bytes[chunk_data_end] != 0) {
+            return None;
+        }
+
+        if offset == 12 {
+            dimensions =
+                webp_first_chunk_dimensions(chunk_type, &bytes[chunk_data_start..chunk_data_end]);
+        }
+        offset = padded_chunk_end;
     }
 
-    match &bytes[12..16] {
-        b"VP8X" if chunk_length >= 10 && bytes.len() >= 30 => Some((
-            1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]),
-            1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]),
-        )),
-        b"VP8 " if chunk_length >= 10 && bytes.len() >= 30 => {
-            if &bytes[23..26] != b"\x9d\x01\x2a" {
+    dimensions
+}
+
+fn webp_first_chunk_dimensions(chunk_type: &[u8], chunk_data: &[u8]) -> Option<(u32, u32)> {
+    match chunk_type {
+        b"VP8X" if chunk_data.len() == 10 => {
+            // In the WebP VP8X feature byte, the Animation (A) flag is bit 6
+            // in the specification's MSB-first diagram, i.e. numeric bit 1
+            // (0x02) in byte 0. Reject it before any preview/frame decode.
+            if chunk_data[0] & 0x02 != 0 {
                 return None;
             }
             Some((
-                u32::from(u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3fff),
-                u32::from(u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3fff),
+                1 + u32::from_le_bytes([chunk_data[4], chunk_data[5], chunk_data[6], 0]),
+                1 + u32::from_le_bytes([chunk_data[7], chunk_data[8], chunk_data[9], 0]),
             ))
         }
-        b"VP8L" if chunk_length >= 5 && bytes.len() >= 25 && bytes[20] == 0x2f => {
-            let dimensions = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
+        b"VP8 " if chunk_data.len() >= 10 => {
+            if &chunk_data[3..6] != b"\x9d\x01\x2a" {
+                return None;
+            }
+            Some((
+                u32::from(u16::from_le_bytes([chunk_data[6], chunk_data[7]]) & 0x3fff),
+                u32::from(u16::from_le_bytes([chunk_data[8], chunk_data[9]]) & 0x3fff),
+            ))
+        }
+        b"VP8L" if chunk_data.len() >= 5 && chunk_data[0] == 0x2f => {
+            let dimensions =
+                u32::from_le_bytes([chunk_data[1], chunk_data[2], chunk_data[3], chunk_data[4]]);
             Some((1 + (dimensions & 0x3fff), 1 + ((dimensions >> 14) & 0x3fff)))
         }
         _ => None,

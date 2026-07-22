@@ -112,6 +112,19 @@ fn pasted_images_are_header_validated_before_they_can_become_attachments_or_prev
 }
 
 #[test]
+fn truncated_png_with_a_safe_ihdr_is_rejected_before_preview_cache_insertion() {
+    let mut state = TaskDialogState::default();
+
+    assert_eq!(
+        state
+            .add_pasted_image("image/png", truncated_png_after_ihdr())
+            .expect_err("a complete IHDR alone is not a complete PNG container"),
+        "The pasted image has an invalid or unsupported header."
+    );
+    assert!(state.attachments().is_empty());
+}
+
+#[test]
 fn rejects_animated_or_vector_and_malformed_image_payloads() {
     let mut state = TaskDialogState::default();
 
@@ -129,31 +142,71 @@ fn rejects_animated_or_vector_and_malformed_image_payloads() {
 }
 
 #[test]
-fn submitting_moves_shared_attachment_bytes_without_a_deep_copy() {
+fn vp8x_animation_flag_is_rejected_without_decoding_frames() {
+    let mut state = TaskDialogState::default();
+
+    state
+        .add_pasted_image("image/webp", vp8x_header(false))
+        .expect("a still VP8X header under the image budget should be accepted");
+    assert_eq!(state.attachments().len(), 1);
+
+    assert_eq!(
+        state
+            .add_pasted_image("image/webp", vp8x_header(true))
+            .expect_err("animated VP8X images must not reach preview decoding"),
+        "The pasted image has an invalid or unsupported header."
+    );
+    assert_eq!(state.attachments().len(), 1);
+
+    let mut trailing_data = vp8x_header(false);
+    trailing_data.push(0);
+    assert!(state.add_pasted_image("image/webp", trailing_data).is_err());
+    assert_eq!(state.attachments().len(), 1);
+}
+
+#[test]
+fn failed_submit_preserves_the_draft_and_shares_attachment_bytes_for_retry() {
     let bytes: Arc<[u8]> = Arc::from(tiny_png());
     let mut state = TaskDialogState::default();
     state.select_workspace(WorkspaceId::new("workspace-1"));
     state.set_title("Preserve image bytes");
+    state.set_context(Some("Keep this context when storage fails".into()));
     state
         .add_pasted_image("image/png", Arc::clone(&bytes))
         .expect("valid image should be accepted");
 
+    let initial_draft = state.clone();
     let input = state
-        .into_new_task_input()
+        .new_task_input_for_submission()
         .expect("valid state should submit");
     let event_boundary_copy = input.clone();
 
+    // Model a storage failure: the Workspace drops the submitted input while
+    // keeping this dialog open. A retry must still start from the same draft.
+    drop(input);
+    assert_eq!(state, initial_draft);
+    assert_eq!(state.workspace_id(), Some(&WorkspaceId::new("workspace-1")));
+    assert_eq!(
+        state.context(),
+        Some("Keep this context when storage fails")
+    );
+    assert_eq!(state.attachments().len(), 1);
+
+    let retry = state
+        .new_task_input_for_submission()
+        .expect("the preserved draft should submit again");
+
     assert!(Arc::ptr_eq(
         &bytes,
-        input.attachments[0]
+        event_boundary_copy.attachments[0]
             .in_memory_bytes_arc()
             .expect("pasted image should remain in memory until storage")
     ));
     assert!(Arc::ptr_eq(
         &bytes,
-        event_boundary_copy.attachments[0]
+        retry.attachments[0]
             .in_memory_bytes_arc()
-            .expect("workspace event clones should retain the same image allocation")
+            .expect("retry submission should retain the same image allocation")
     ));
 }
 
@@ -172,5 +225,29 @@ fn png_header(width: u32, height: u32) -> Vec<u8> {
     let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
     bytes.extend_from_slice(&width.to_be_bytes());
     bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]); // IHDR remainder
+    bytes.extend_from_slice(&[0, 0, 0, 0]); // CRC is outside header validation
+    bytes.extend_from_slice(b"\0\0\0\x01IDAT\0\0\0\0\0");
+    bytes.extend_from_slice(b"\0\0\0\0IEND\0\0\0\0");
+    bytes
+}
+
+fn truncated_png_after_ihdr() -> Vec<u8> {
+    // Retain the signature, complete IHDR payload, and genuine IHDR CRC from
+    // the valid fixture—then omit IDAT and IEND.
+    tiny_png()[..33].to_vec()
+}
+
+/// A complete VP8X header is enough for our validation path: it establishes
+/// the feature flags and canvas size without asking an image decoder for any
+/// frame data. The RIFF length covers exactly `WEBP` + the 10-byte VP8X chunk.
+fn vp8x_header(animated: bool) -> Vec<u8> {
+    let mut bytes = b"RIFF\x16\0\0\0WEBPVP8X\x0a\0\0\0".to_vec();
+    // VP8X feature byte: animation is bit 1 (0x02). The container spec's
+    // diagram numbers bits MSB-first; this is the A flag's byte value.
+    bytes.push(if animated { 0x02 } else { 0x00 });
+    bytes.extend_from_slice(&[0, 0, 0]); // reserved bits
+    bytes.extend_from_slice(&[1, 0, 0]); // canvas width: 2
+    bytes.extend_from_slice(&[2, 0, 0]); // canvas height: 3
     bytes
 }
