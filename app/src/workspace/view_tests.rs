@@ -82,6 +82,10 @@ use crate::user_config::tab_configs_dir;
 use crate::util::traffic_lights::windows::RendererState;
 use crate::warp_managed_paths_watcher::WarpManagedPathsWatcher;
 use crate::workflows::local_workflows::LocalWorkflows;
+use crate::workspace::task_queue::{
+    AgentKind, NewTaskInput, Task, TaskQueueModel, TaskStatus, TaskStore, TaskWorkspace,
+    WorkspaceId, WorkspaceSource,
+};
 use crate::workspaces::team_tester::TeamTesterStatus;
 use crate::workspaces::update_manager::TeamUpdateManager;
 use crate::workspaces::user_profiles::UserProfiles;
@@ -275,6 +279,437 @@ pub(crate) fn mock_workspace(app: &mut App) -> ViewHandle<Workspace> {
         )
     });
     workspace
+}
+
+fn queue_task_for_workspace(
+    app: &mut App,
+    store: &TaskStore,
+    workspace_path: &std::path::Path,
+) -> Task {
+    let workspace = TaskWorkspace::new(
+        WorkspaceId::new("workspace-task-launch"),
+        WorkspaceSource::Github,
+        workspace_path,
+        "workspace-task-launch",
+    );
+    let task = store
+        .create(
+            NewTaskInput::new(workspace.id.clone(), "Launch queue task").with_workspace(workspace),
+        )
+        .expect("task should persist");
+
+    app.update(|ctx| {
+        TaskQueueModel::handle(ctx).update(ctx, |queue, _| {
+            queue.set_store_for_test(store.clone());
+            queue.insert_task(task.clone());
+        });
+    });
+    task
+}
+
+fn task_from_queue(app: &App, task_id: &crate::workspace::task_queue::TaskId) -> Task {
+    app.read(|ctx| {
+        TaskQueueModel::as_ref(ctx)
+            .task(task_id)
+            .cloned()
+            .expect("task should remain in queue")
+    })
+}
+
+fn active_terminal(workspace: &ViewHandle<Workspace>, app: &App) -> ViewHandle<TerminalView> {
+    workspace.read(app, |workspace, ctx| {
+        workspace
+            .active_tab_pane_group()
+            .as_ref(ctx)
+            .active_session_view(ctx)
+            .expect("active tab should contain a terminal")
+    })
+}
+
+#[test]
+fn launch_task_claims_the_queue_before_shell_start_and_rejects_a_second_tab() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        let workspace = mock_workspace(&mut app);
+        let initial_tab_count = workspace.read(&app, |workspace, _| workspace.tab_count());
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+        });
+
+        let launched = task_from_queue(&app, &task.id);
+        assert_eq!(launched.status, TaskStatus::InProgress);
+        assert!(launched.terminal_pane_id.is_some());
+        assert_eq!(
+            workspace.read(&app, |workspace, _| workspace.tab_count()),
+            initial_tab_count + 1
+        );
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::ClaudeCode,
+                },
+                ctx,
+            );
+        });
+
+        assert_eq!(
+            workspace.read(&app, |workspace, _| workspace.tab_count()),
+            initial_tab_count + 1
+        );
+        assert_eq!(task_from_queue(&app, &task.id), launched);
+    });
+}
+
+#[test]
+fn launch_task_with_a_missing_workspace_persists_attention_without_opening_a_tab() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let project_path = project.path().to_path_buf();
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, &project_path);
+        std::fs::remove_dir_all(&project_path).expect("workspace should disappear");
+        let workspace = mock_workspace(&mut app);
+        let initial_tab_count = workspace.read(&app, |workspace, _| workspace.tab_count());
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+        });
+
+        let task = task_from_queue(&app, &task.id);
+        assert_eq!(task.status, TaskStatus::AttentionRequired);
+        assert_eq!(task.terminal_pane_id, None);
+        assert_eq!(
+            workspace.read(&app, |workspace, _| workspace.tab_count()),
+            initial_tab_count
+        );
+    });
+}
+
+#[test]
+fn failed_task_launch_persistence_reverts_only_the_new_task_tab() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        std::fs::remove_file(store.task_markdown_path(&task.workspace_id, &task.id))
+            .expect("task Markdown should be removed to force persistence failure");
+        let workspace = mock_workspace(&mut app);
+        let (initial_tab_count, initial_pane_group_id) = workspace.read(&app, |workspace, _| {
+            (workspace.tab_count(), workspace.tabs[0].pane_group.id())
+        });
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+        });
+
+        let task = task_from_queue(&app, &task.id);
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(task.terminal_pane_id, None);
+        assert_eq!(
+            workspace.read(&app, |workspace, _| workspace.tab_count()),
+            initial_tab_count
+        );
+        assert!(workspace.read(&app, |workspace, _| {
+            workspace
+                .tabs
+                .iter()
+                .any(|tab| tab.pane_group.id() == initial_pane_group_id)
+        }));
+    });
+}
+
+#[test]
+fn workspace_removed_during_task_bootstrap_requires_attention_without_sending_the_wrapper() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let project_path = project.path().to_path_buf();
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, &project_path);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+        });
+        std::fs::remove_dir_all(&project_path)
+            .expect("workspace should disappear during bootstrap");
+        let terminal = active_terminal(&workspace, &app);
+        terminal.update(&mut app, |_terminal, ctx| {
+            ctx.emit(crate::terminal::Event::ShellSpawned(
+                crate::terminal::shell::ShellType::Zsh,
+            ));
+        });
+
+        let task = task_from_queue(&app, &task.id);
+        assert_eq!(task.status, TaskStatus::AttentionRequired);
+        assert_eq!(task.terminal_pane_id, None);
+        assert!(!terminal.read(&app, |terminal, ctx| {
+            terminal.has_pending_command_or_awaiting_completion(ctx)
+        }));
+    });
+}
+
+#[test]
+fn linked_task_command_success_moves_only_that_task_to_review_required() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+        });
+        let terminal = active_terminal(&workspace, &app);
+        terminal.update(&mut app, |_terminal, ctx| {
+            ctx.emit(crate::terminal::Event::ShellSpawned(
+                crate::terminal::shell::ShellType::Zsh,
+            ));
+            // A duplicate shell event must not submit the wrapper twice.
+            ctx.emit(crate::terminal::Event::ShellSpawned(
+                crate::terminal::shell::ShellType::Zsh,
+            ));
+        });
+        assert!(terminal.read(&app, |terminal, ctx| {
+            terminal.has_pending_command_or_awaiting_completion(ctx)
+        }));
+        terminal.update(&mut app, |_terminal, ctx| {
+            ctx.emit(crate::terminal::Event::PendingCommandCompleted { success: true });
+        });
+
+        let task = task_from_queue(&app, &task.id);
+        assert_eq!(task.status, TaskStatus::ReviewRequired);
+        assert_eq!(task.terminal_pane_id, None);
+    });
+}
+
+#[test]
+fn linked_task_command_failure_moves_only_that_task_to_attention_required() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::ClaudeCode,
+                },
+                ctx,
+            );
+        });
+        let terminal = active_terminal(&workspace, &app);
+        terminal.update(&mut app, |_terminal, ctx| {
+            ctx.emit(crate::terminal::Event::ShellSpawned(
+                crate::terminal::shell::ShellType::Zsh,
+            ));
+            ctx.emit(crate::terminal::Event::PendingCommandCompleted { success: false });
+        });
+
+        let task = task_from_queue(&app, &task.id);
+        assert_eq!(task.status, TaskStatus::AttentionRequired);
+        assert_eq!(task.terminal_pane_id, None);
+    });
+}
+
+#[test]
+fn linked_task_pty_spawn_failure_requires_attention_without_a_command() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+        });
+        let terminal = active_terminal(&workspace, &app);
+        terminal.update(&mut app, |_terminal, ctx| {
+            ctx.emit(crate::terminal::Event::PtySpawnFailed {
+                reason: "test PTY failure".into(),
+            });
+        });
+
+        let task = task_from_queue(&app, &task.id);
+        assert_eq!(task.status, TaskStatus::AttentionRequired);
+        assert_eq!(task.terminal_pane_id, None);
+        assert!(!terminal.read(&app, |terminal, ctx| {
+            terminal.has_pending_command_or_awaiting_completion(ctx)
+        }));
+    });
+}
+
+#[test]
+fn closing_a_linked_task_terminal_requires_attention_and_clears_its_link() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+        });
+        let terminal = active_terminal(&workspace, &app);
+        terminal.update(&mut app, |_terminal, ctx| {
+            ctx.emit(crate::terminal::Event::CloseRequested);
+        });
+
+        let task = task_from_queue(&app, &task.id);
+        assert_eq!(task.status, TaskStatus::AttentionRequired);
+        assert_eq!(task.terminal_pane_id, None);
+    });
+}
+
+#[test]
+fn linked_task_shell_exit_requires_attention_and_clears_its_link() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+        });
+        let terminal = active_terminal(&workspace, &app);
+        terminal.update(&mut app, |_terminal, ctx| {
+            ctx.emit(crate::terminal::Event::Exited);
+        });
+
+        let task = task_from_queue(&app, &task.id);
+        assert_eq!(task.status, TaskStatus::AttentionRequired);
+        assert_eq!(task.terminal_pane_id, None);
+    });
+}
+
+#[test]
+fn closing_a_task_tab_requires_attention_without_touching_the_original_session() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        let workspace = mock_workspace(&mut app);
+        let initial_pane_group_id =
+            workspace.read(&app, |workspace, _| workspace.tabs[0].pane_group.id());
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(
+                &WorkspaceAction::LaunchTask {
+                    task_id: task.id.clone(),
+                    agent: AgentKind::Codex,
+                },
+                ctx,
+            );
+            workspace.handle_action(&WorkspaceAction::CloseActiveTab, ctx);
+        });
+
+        let task = task_from_queue(&app, &task.id);
+        assert_eq!(task.status, TaskStatus::AttentionRequired);
+        assert_eq!(task.terminal_pane_id, None);
+        assert!(workspace.read(&app, |workspace, _| {
+            workspace
+                .tabs
+                .iter()
+                .any(|tab| tab.pane_group.id() == initial_pane_group_id)
+        }));
+    });
+}
+
+#[test]
+fn a_manual_terminal_event_never_changes_a_queued_task() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let data = tempfile::tempdir().expect("task data directory should be created");
+        let project = tempfile::tempdir().expect("workspace should be created");
+        let store = TaskStore::open(data.path());
+        let task = queue_task_for_workspace(&mut app, &store, project.path());
+        let workspace = mock_workspace(&mut app);
+        let terminal = active_terminal(&workspace, &app);
+
+        terminal.update(&mut app, |_terminal, ctx| {
+            ctx.emit(crate::terminal::Event::PendingCommandCompleted { success: true });
+            ctx.emit(crate::terminal::Event::Exited);
+        });
+
+        let task = task_from_queue(&app, &task.id);
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(task.terminal_pane_id, None);
+    });
 }
 
 fn restored_workspace(

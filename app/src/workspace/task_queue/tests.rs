@@ -497,6 +497,79 @@ fn failed_launch_persistence_keeps_the_model_task_pending_and_unlinked() {
 }
 
 #[test]
+fn unavailable_workspace_before_launch_persists_attention_without_a_pane_link() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let workspace_path = workspace.path().to_path_buf();
+    let store = TaskStore::open(data.path());
+    let created = store
+        .create(stored_task_input(stored_workspace(&workspace_path)))
+        .expect("task should persist");
+    let mut model = TaskQueueModel::new();
+    model
+        .load_from_store(&store)
+        .expect("task should load into the queue");
+    fs::remove_dir_all(&workspace_path).expect("workspace should disappear before launch");
+
+    assert!(
+        model
+            .launch_with_store(&store, &created.id, AgentKind::Codex, "terminal-pane-1")
+            .is_err()
+    );
+
+    let task = model.task(&created.id).expect("task should remain visible");
+    assert_eq!(task.status, TaskStatus::AttentionRequired);
+    assert_eq!(task.terminal_pane_id, None);
+    assert!(
+        task.attention_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("workspace"))
+    );
+    let reloaded = store
+        .list()
+        .expect("task should reload")
+        .tasks
+        .pop()
+        .expect("task should remain persisted");
+    assert_eq!(reloaded.status, TaskStatus::AttentionRequired);
+    assert_eq!(reloaded.terminal_pane_id, None);
+}
+
+#[test]
+fn launch_claim_prevents_a_second_terminal_pane_before_the_shell_starts() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+    let created = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("task should persist");
+    let mut model = TaskQueueModel::new();
+    model
+        .load_from_store(&store)
+        .expect("task should load into the queue");
+
+    model
+        .launch_with_store(&store, &created.id, AgentKind::Codex, "terminal-pane-1")
+        .expect("first launch should claim the task before shell startup");
+
+    assert!(
+        model
+            .launch_with_store(
+                &store,
+                &created.id,
+                AgentKind::ClaudeCode,
+                "terminal-pane-2"
+            )
+            .is_err()
+    );
+
+    let task = model.task(&created.id).expect("task should remain visible");
+    assert_eq!(task.status, TaskStatus::InProgress);
+    assert_eq!(task.terminal_pane_id.as_deref(), Some("terminal-pane-1"));
+    assert_eq!(task.agent_kind, AgentKind::Codex);
+}
+
+#[test]
 fn model_uses_discovered_workspace_metadata_when_persisting_an_input_by_id() {
     let data = tempfile::tempdir().expect("data directory should be created");
     let sources = tempfile::tempdir().expect("workspace sources should be created");

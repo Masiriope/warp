@@ -451,6 +451,10 @@ pub(crate) enum TaskQueueError {
 pub(crate) enum TaskQueuePersistError {
     #[error("task {0:?} no longer exists in the queue")]
     TaskNotFound(TaskId),
+    #[error("task {0:?} has no workspace metadata")]
+    WorkspaceMetadataMissing(TaskId),
+    #[error("workspace is unavailable: {path}")]
+    WorkspaceUnavailable { path: PathBuf },
     #[error(transparent)]
     Transition(#[from] TaskQueueError),
     #[error(transparent)]
@@ -462,6 +466,7 @@ pub(crate) struct TaskQueueModel {
     sources: Vec<WorkspaceRoot>,
     workspaces: Vec<DiscoveredWorkspace>,
     tasks: HashMap<TaskId, Task>,
+    store: Option<TaskStore>,
     load_errors: Vec<TaskLoadError>,
     store_load_error: Option<String>,
     initialization_error: Option<TaskQueueError>,
@@ -490,22 +495,22 @@ impl TaskQueueModel {
     /// behavior testable without coupling tests to the active channel path.
     pub(crate) fn from_roots_and_store(roots: Vec<WorkspaceRoot>, store: &TaskStore) -> Self {
         let mut model = Self::from_roots(roots);
+        model.store = Some(store.clone());
         model.reload_from_store(store);
         model
     }
 
     pub(crate) fn from_home(home: Option<PathBuf>) -> Self {
+        let store = TaskStore::open_in_active_channel_data_directory();
         match home {
-            Some(home) => Self::from_roots_and_store(
-                default_sources(home),
-                &TaskStore::open_in_active_channel_data_directory(),
-            ),
+            Some(home) => Self::from_roots_and_store(default_sources(home), &store),
             None => {
                 let mut model = Self {
+                    store: Some(store.clone()),
                     initialization_error: Some(TaskQueueError::HomeDirectoryUnavailable),
                     ..Self::new()
                 };
-                model.reload_from_store(&TaskStore::open_in_active_channel_data_directory());
+                model.reload_from_store(&store);
                 model
             }
         }
@@ -605,7 +610,7 @@ impl TaskQueueModel {
         input: NewTaskInput,
         ctx: &mut ModelContext<Self>,
     ) -> Result<Task, TaskStoreError> {
-        let store = TaskStore::open_in_active_channel_data_directory();
+        let store = self.active_store();
         self.create_with_store_and_notify(&store, input, ctx)
     }
 
@@ -631,6 +636,11 @@ impl TaskQueueModel {
         self.tasks.get(task_id)
     }
 
+    pub(crate) fn task_markdown_path(&self, task: &Task) -> PathBuf {
+        self.active_store()
+            .task_markdown_path(&task.workspace_id, &task.id)
+    }
+
     pub(crate) fn tasks_for_workspace(&self, workspace_id: &WorkspaceId) -> Vec<&Task> {
         self.tasks
             .values()
@@ -647,6 +657,26 @@ impl TaskQueueModel {
         agent_kind: AgentKind,
         terminal_pane_id: impl Into<String>,
     ) -> Result<Task, TaskQueuePersistError> {
+        let workspace_path = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| TaskQueuePersistError::TaskNotFound(task_id.clone()))?
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.path.clone())
+            .ok_or_else(|| TaskQueuePersistError::WorkspaceMetadataMissing(task_id.clone()))?;
+        if !workspace_path.is_dir() {
+            self.update_task_with_store(store, task_id, |task| {
+                task.mark_attention_required(format!(
+                    "El workspace ya no está disponible: {}",
+                    workspace_path.display()
+                ))
+            })?;
+            return Err(TaskQueuePersistError::WorkspaceUnavailable {
+                path: workspace_path,
+            });
+        }
+
         let terminal_pane_id = terminal_pane_id.into();
         self.update_task_with_store(store, task_id, |task| {
             task.agent_kind = agent_kind;
@@ -682,7 +712,7 @@ impl TaskQueueModel {
         terminal_pane_id: impl Into<String>,
         ctx: &mut ModelContext<Self>,
     ) -> Result<Task, TaskQueuePersistError> {
-        let store = TaskStore::open_in_active_channel_data_directory();
+        let store = self.active_store();
         let task = self.launch_with_store(&store, task_id, agent_kind, terminal_pane_id)?;
         ctx.emit(TaskQueueEvent::Updated);
         Ok(task)
@@ -694,7 +724,7 @@ impl TaskQueueModel {
         success: bool,
         ctx: &mut ModelContext<Self>,
     ) -> Result<Task, TaskQueuePersistError> {
-        let store = TaskStore::open_in_active_channel_data_directory();
+        let store = self.active_store();
         let task = self.finish_linked_command_with_store(&store, task_id, success)?;
         ctx.emit(TaskQueueEvent::Updated);
         Ok(task)
@@ -706,7 +736,7 @@ impl TaskQueueModel {
         reason: impl Into<String>,
         ctx: &mut ModelContext<Self>,
     ) -> Result<Task, TaskQueuePersistError> {
-        let store = TaskStore::open_in_active_channel_data_directory();
+        let store = self.active_store();
         let task = self.require_linked_task_attention_with_store(&store, task_id, reason)?;
         ctx.emit(TaskQueueEvent::Updated);
         Ok(task)
@@ -727,6 +757,17 @@ impl TaskQueueModel {
         store.update(&updated)?;
         self.tasks.insert(task_id.clone(), updated.clone());
         Ok(updated)
+    }
+
+    fn active_store(&self) -> TaskStore {
+        self.store
+            .clone()
+            .unwrap_or_else(TaskStore::open_in_active_channel_data_directory)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_store_for_test(&mut self, store: TaskStore) {
+        self.store = Some(store);
     }
 
     fn reload_from_store(&mut self, store: &TaskStore) {
