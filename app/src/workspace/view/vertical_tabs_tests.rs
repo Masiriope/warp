@@ -17,8 +17,8 @@ use super::{
     push_normalized_unique_summary_label, search_fragments_contain_query,
     select_summary_pane_kind_icons, should_keep_detail_sidecar_visible_for_mouse_position,
     should_show_tab_group_header, sort_summary_primary_labels_status_first, summary_overflow_count,
-    summary_search_text_fragments, terminal_kind_badge_label, terminal_primary_line_data,
-    terminal_pull_request_badge_label, terminal_search_text_fragments,
+    summary_search_text_fragments, task_id_for_tab_item, terminal_kind_badge_label,
+    terminal_primary_line_data, terminal_pull_request_badge_label, terminal_search_text_fragments,
     terminal_title_fallback_font, uses_outer_group_container, visible_pane_ids_for_detail_target,
     vtab_diff_stats_text,
 };
@@ -109,6 +109,52 @@ fn task_pane_partition_only_groups_panes_that_survived_search_filtering() {
     assert!(ordinary.is_empty());
     assert_eq!(linked.len(), 1);
     assert_eq!(linked[0].session, (3, PaneId::from(task_pane)));
+}
+
+#[test]
+fn tab_item_task_classification_uses_only_the_representative_pane_in_both_modes() {
+    let task_pane = TerminalPaneId::dummy_terminal_pane_id();
+    let manual_pane = TerminalPaneId::dummy_terminal_pane_id();
+    let task_id = TaskId::new("LOCAL-044");
+    let all_split_panes = [PaneId::from(task_pane), PaneId::from(manual_pane)];
+
+    for mode in [
+        super::VerticalTabsResolvedMode::FocusedSession,
+        super::VerticalTabsResolvedMode::Summary,
+    ] {
+        // A focused manual pane has a linked sibling, but stays ordinary in
+        // both tab-item modes. This also mirrors the subset supplied by a
+        // manual-pane search result.
+        assert_eq!(
+            task_id_for_tab_item(
+                mode,
+                &all_split_panes,
+                manual_pane.into(),
+                None,
+                |pane_id| (pane_id == PaneId::from(task_pane)).then_some(task_id.clone()),
+            ),
+            None
+        );
+        let manual_search_match = [PaneId::from(manual_pane)];
+        assert_eq!(
+            task_id_for_tab_item(
+                mode,
+                &all_split_panes,
+                manual_pane.into(),
+                Some(&manual_search_match),
+                |pane_id| (pane_id == PaneId::from(task_pane)).then_some(task_id.clone()),
+            ),
+            None
+        );
+
+        // Focusing the linked terminal produces the task row as intended.
+        assert_eq!(
+            task_id_for_tab_item(mode, &all_split_panes, task_pane.into(), None, |pane_id| {
+                (pane_id == PaneId::from(task_pane)).then_some(task_id.clone())
+            },),
+            Some(task_id.clone())
+        );
+    }
 }
 
 #[test]

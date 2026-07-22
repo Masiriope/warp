@@ -2119,11 +2119,15 @@ fn render_groups(
             visible_tabs
                 .into_iter()
                 .map(|(tab_index, filtered_pane_ids)| {
-                    let task_id = workspace
-                        .tabs
-                        .get(tab_index)
-                        .and_then(|tab| task_id_for_tab(workspace, tab, app))
-                        .filter(|task_id| TaskQueueModel::as_ref(app).task(task_id).is_some());
+                    let pane_group = workspace.tabs[tab_index].pane_group.as_ref(app);
+                    let task_id = task_id_for_tab_item(
+                        resolved_mode,
+                        &pane_group.visible_pane_ids(),
+                        pane_group.focused_pane_id(app),
+                        filtered_pane_ids.as_deref(),
+                        |pane_id| task_id_for_pane(workspace, pane_id),
+                    )
+                    .filter(|task_id| TaskQueueModel::as_ref(app).task(task_id).is_some());
                     TaskSessionRow {
                         session: TaskSessionReference {
                             tab_index,
@@ -2340,18 +2344,28 @@ fn task_id_for_pane(workspace: &Workspace, pane_id: PaneId) -> Option<TaskId> {
     })
 }
 
-fn task_id_for_tab(workspace: &Workspace, tab: &TabData, app: &AppContext) -> Option<TaskId> {
-    tab.pane_group
-        .as_ref(app)
-        .terminal_pane_ids()
-        .find_map(|pane_id| {
-            pane_id.as_terminal_pane_id().and_then(|terminal_pane_id| {
-                workspace
-                    .task_terminal_launches
-                    .get(&terminal_pane_id)
-                    .cloned()
-            })
-        })
+/// Classifies a tab-item row from only its represented pane. Both focused and
+/// summary tab modes render one focused representative; neither may inspect a
+/// task sibling in that tab's split.
+fn task_id_for_tab_item(
+    mode: VerticalTabsResolvedMode,
+    visible_pane_ids: &[PaneId],
+    focused_pane_id: PaneId,
+    filtered_pane_ids: Option<&[PaneId]>,
+    task_for_pane: impl Fn(PaneId) -> Option<TaskId>,
+) -> Option<TaskId> {
+    debug_assert!(mode != VerticalTabsResolvedMode::Panes);
+    let representative_pane_ids = filtered_pane_ids.map_or_else(
+        || {
+            pane_ids_for_display_granularity(
+                visible_pane_ids,
+                focused_pane_id,
+                VerticalTabsDisplayGranularity::Tabs,
+            )
+        },
+        ToOwned::to_owned,
+    );
+    representative_pane_ids.into_iter().find_map(task_for_pane)
 }
 
 fn render_session_section_heading(label: &'static str, app: &AppContext) -> Box<dyn Element> {
