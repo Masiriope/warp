@@ -398,6 +398,8 @@ pub(crate) enum TaskQueueError {
     TaskNotFound(TaskId),
     #[error("task Markdown path must be absolute: {0}")]
     RelativeTaskMarkdownPath(PathBuf),
+    #[error("task Markdown path must be named task.md: {0}")]
+    InvalidTaskMarkdownPath(PathBuf),
 }
 
 #[derive(Default)]

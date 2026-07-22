@@ -835,15 +835,14 @@ fn shell_quote_uses_posix_single_quote_escaping() {
 
 #[test]
 fn launch_command_keeps_newline_and_shell_metacharacters_in_one_quoted_prompt_argument() {
-    let task_path = Path::new("/tmp/task.md\n; touch /tmp/should-not-run");
+    let task_path = Path::new("/tmp/task\n; touch /tmp/should-not-run; /safe/task.md");
     let command = build_launch_command(AgentKind::Codex, task_path)
         .expect("absolute paths should build a launch command");
 
     assert_eq!(
         command,
-        "codexauto 'Lee y ejecuta la tarea en /tmp/task.md\n; touch /tmp/should-not-run, incluidos sus adjuntos.'"
+        "codexauto 'Lee y ejecuta la tarea en /tmp/task\n; touch /tmp/should-not-run; /safe/task.md, incluidos sus adjuntos.'"
     );
-    assert_eq!(command.matches('\'').count(), 2);
 }
 
 #[test]
@@ -852,4 +851,32 @@ fn launch_command_rejects_relative_task_markdown_paths() {
         .expect_err("relative task paths must not produce a launch command");
 
     assert!(error.to_string().contains("absolute"));
+}
+
+#[test]
+fn launch_command_rejects_absolute_paths_that_are_not_task_markdown() {
+    for path in [Path::new("/tmp/readme.md"), Path::new("/etc/passwd")] {
+        let error = build_launch_command(AgentKind::Codex, path)
+            .expect_err("only task.md paths should produce a launch command");
+
+        assert_eq!(
+            error,
+            TaskQueueError::InvalidTaskMarkdownPath(path.to_path_buf())
+        );
+    }
+}
+
+#[test]
+fn launch_command_escapes_quote_breakout_attempts_in_task_markdown_paths() {
+    let task_path = Path::new("/tmp/task'; touch /tmp/should-not-run; '/task.md");
+    let prompt = format!(
+        "Lee y ejecuta la tarea en {}, incluidos sus adjuntos.",
+        task_path.display()
+    );
+
+    let command = build_launch_command(AgentKind::Codex, task_path)
+        .expect("an absolute task.md path should build a launch command");
+
+    assert_eq!(command, format!("codexauto {}", shell_quote(&prompt)));
+    assert!(command.ends_with('\''));
 }
