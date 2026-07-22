@@ -3,6 +3,11 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -90,9 +95,9 @@ impl WorkspaceId {
         Self(value.into())
     }
 
-    fn from_path(path: &Path) -> Self {
+    pub(crate) fn from_path(path: &Path) -> Self {
         let normalized = normalize_path(path);
-        let digest = Sha256::digest(normalized.to_string_lossy().as_bytes());
+        let digest = Sha256::digest(path_identity_bytes(&normalized));
         Self(format!("{digest:x}"))
     }
 }
@@ -194,10 +199,18 @@ impl Task {
         &mut self,
         terminal_pane_id: impl Into<String>,
     ) -> Result<(), TaskQueueError> {
-        self.require_status(TaskStatus::Pending, "launch")?;
-        self.terminal_pane_id = Some(terminal_pane_id.into());
-        self.status = TaskStatus::InProgress;
-        Ok(())
+        match self.status {
+            TaskStatus::Pending | TaskStatus::AttentionRequired => {
+                self.terminal_pane_id = Some(terminal_pane_id.into());
+                self.status = TaskStatus::InProgress;
+                self.attention_reason = None;
+                Ok(())
+            }
+            status => Err(TaskQueueError::InvalidTaskTransition {
+                action: "launch",
+                status,
+            }),
+        }
     }
 
     pub(crate) fn mark_command_finished(&mut self, success: bool) -> Result<(), TaskQueueError> {
@@ -217,7 +230,7 @@ impl Task {
         reason: impl Into<String>,
     ) -> Result<(), TaskQueueError> {
         match self.status {
-            TaskStatus::InProgress | TaskStatus::ReviewRequired => {
+            TaskStatus::Pending | TaskStatus::InProgress | TaskStatus::ReviewRequired => {
                 self.status = TaskStatus::AttentionRequired;
                 self.attention_reason = Some(reason.into());
                 Ok(())
@@ -286,6 +299,8 @@ impl DiscoveredWorkspace {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub(crate) enum TaskQueueError {
+    #[error("could not determine the home directory for the task queue")]
+    HomeDirectoryUnavailable,
     #[error("cannot {action} a task in {status:?} status")]
     InvalidTaskTransition {
         action: &'static str,
@@ -304,11 +319,32 @@ pub(crate) struct TaskQueueModel {
     tasks: HashMap<TaskId, Task>,
     selected_workspace_id: Option<WorkspaceId>,
     selected_task_id: Option<TaskId>,
+    initialization_error: Option<TaskQueueError>,
 }
 
 impl TaskQueueModel {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn from_roots(roots: Vec<WorkspaceRoot>) -> Self {
+        let mut model = Self::new();
+        model.discover(roots);
+        model
+    }
+
+    pub(crate) fn from_home(home: Option<PathBuf>) -> Self {
+        match home {
+            Some(home) => Self::from_roots(default_sources(home)),
+            None => Self {
+                initialization_error: Some(TaskQueueError::HomeDirectoryUnavailable),
+                ..Self::new()
+            },
+        }
+    }
+
+    pub(crate) fn initialization_error(&self) -> Option<&TaskQueueError> {
+        self.initialization_error.as_ref()
     }
 
     pub(crate) fn discover(&mut self, sources: Vec<WorkspaceRoot>) {
@@ -461,14 +497,38 @@ fn normalize_path(path: &Path) -> PathBuf {
             Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
             Component::RootDir => normalized.push(component.as_os_str()),
             Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() && !normalized.has_root() {
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                Some(Component::CurDir | Component::ParentDir) | None => {
                     normalized.push(component.as_os_str());
                 }
-            }
+            },
             Component::Normal(component) => normalized.push(component),
         }
     }
 
     normalized
+}
+
+#[cfg(unix)]
+fn path_identity_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn path_identity_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn path_identity_bytes(path: &Path) -> Vec<u8> {
+    // This fallback has deterministic UTF-8 semantics on platforms without an
+    // OS-specific byte or wide-character representation exposed by the standard library.
+    path.as_os_str().to_string_lossy().as_bytes().to_vec()
 }

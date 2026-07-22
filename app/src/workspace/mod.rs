@@ -84,7 +84,7 @@ use crate::workspace::view::{
 
 pub fn init(app: &mut AppContext) {
     app.add_singleton_model(|_| WorkspaceRegistry::new());
-    app.add_singleton_model(|_| TaskQueueModel::new());
+    app.add_singleton_model(|_| TaskQueueModel::from_home(dirs::home_dir()));
     app.add_singleton_model(|_| cross_window_tab_drag::CrossWindowTabDrag::new());
     use warpui::keymap::macros::*;
     app.register_binding_validator::<Workspace>(is_binding_pty_compliant);

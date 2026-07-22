@@ -1,8 +1,14 @@
 use std::fs;
+use std::path::Path;
+
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 
 use super::{
-    AgentKind, NewTaskInput, Task, TaskId, TaskPriority, TaskQueueModel, TaskStatus, WorkspaceRoot,
-    WorkspaceSource, default_sources,
+    AgentKind, NewTaskInput, Task, TaskId, TaskPriority, TaskQueueError, TaskQueueModel,
+    TaskStatus, WorkspaceId, WorkspaceRoot, WorkspaceSource, default_sources,
 };
 
 #[test]
@@ -40,6 +46,38 @@ fn discovers_direct_child_workspaces_in_their_source_groups() {
 }
 
 #[test]
+fn model_construction_from_roots_discovers_workspaces() {
+    let home = tempfile::tempdir().expect("home directory should be created");
+    let github = home.path().join("Documents/GitHub");
+    let active_projects = home.path().join("Desktop/01_Proyectos_Activos");
+    fs::create_dir_all(github.join("MGA-Portal")).expect("github workspace should be created");
+    fs::create_dir_all(active_projects.join("warp"))
+        .expect("active project workspace should be created");
+
+    let model = TaskQueueModel::from_roots(default_sources(home.path()));
+
+    assert_eq!(model.workspaces().len(), 2);
+    assert_eq!(model.initialization_error(), None);
+}
+
+#[test]
+fn model_without_a_home_remains_usable_and_reports_its_initialization_error() {
+    let home = tempfile::tempdir().expect("home directory should be created");
+    let github = home.path().join("github");
+    fs::create_dir_all(github.join("MGA-Portal")).expect("workspace should be created");
+
+    let mut model = TaskQueueModel::from_home(None);
+    assert!(model.workspaces().is_empty());
+    assert_eq!(
+        model.initialization_error(),
+        Some(&TaskQueueError::HomeDirectoryUnavailable)
+    );
+
+    model.discover(vec![WorkspaceRoot::new(WorkspaceSource::Github, github)]);
+    assert_eq!(model.workspaces().len(), 1);
+}
+
+#[test]
 fn task_requires_explicit_review_before_completion() {
     let workspace_id = super::WorkspaceId::new("workspace-1");
     let mut task = Task::new(
@@ -59,6 +97,37 @@ fn task_requires_explicit_review_before_completion() {
     task.mark_done()
         .expect("review-required task should be explicitly completed");
     assert_eq!(task.status, TaskStatus::Done);
+}
+
+#[test]
+fn pending_tasks_can_require_attention_and_retry_without_losing_the_reason_early() {
+    let mut task = Task::new(
+        TaskId::new("task-1"),
+        NewTaskInput::new(WorkspaceId::new("workspace-1"), "Retry failed launch"),
+    );
+
+    task.mark_attention_required("Workspace was unavailable")
+        .expect("pending task should be able to report a launch failure");
+    assert_eq!(task.status, TaskStatus::AttentionRequired);
+    assert_eq!(
+        task.attention_reason.as_deref(),
+        Some("Workspace was unavailable")
+    );
+    assert!(task.mark_done().is_err());
+    assert!(task.mark_command_finished(true).is_err());
+    assert_eq!(task.status, TaskStatus::AttentionRequired);
+    assert_eq!(
+        task.attention_reason.as_deref(),
+        Some("Workspace was unavailable")
+    );
+
+    task.mark_launched("terminal-pane-2")
+        .expect("attention-required task should be retryable");
+    assert_eq!(task.status, TaskStatus::InProgress);
+    assert_eq!(task.attention_reason, None);
+    task.mark_command_finished(true)
+        .expect("retried task should still require review");
+    assert_eq!(task.status, TaskStatus::ReviewRequired);
 }
 
 #[test]
@@ -82,6 +151,26 @@ fn discovery_sorts_case_insensitively_and_ids_include_the_path() {
 
     let active_workspace = &model.workspaces_for_source(WorkspaceSource::ActiveProjects)[0];
     assert_ne!(github_workspaces[0].id, active_workspace.id);
+}
+
+#[test]
+fn workspace_ids_preserve_leading_parent_components() {
+    assert_ne!(
+        WorkspaceId::from_path(Path::new("../../repo")),
+        WorkspaceId::from_path(Path::new("repo"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_ids_distinguish_non_utf8_path_bytes() {
+    let first = OsString::from_vec(b"/tmp/repo-\x80".to_vec());
+    let second = OsString::from_vec(b"/tmp/repo-\x81".to_vec());
+
+    assert_ne!(
+        WorkspaceId::from_path(Path::new(&first)),
+        WorkspaceId::from_path(Path::new(&second))
+    );
 }
 
 #[test]
