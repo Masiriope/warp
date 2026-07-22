@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -12,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use warpui::{Entity, SingletonEntity};
+
+use super::{TaskLoadError, TaskStore, TaskStoreError};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum TaskStatus {
@@ -59,6 +62,21 @@ impl WorkspaceSource {
             Self::ActiveProjects => "Active Projects",
         }
     }
+
+    pub(crate) const fn storage_name(self) -> &'static str {
+        match self {
+            Self::Github => "github",
+            Self::ActiveProjects => "active_projects",
+        }
+    }
+
+    pub(crate) fn from_storage_name(value: &str) -> Option<Self> {
+        match value {
+            "github" => Some(Self::Github),
+            "active_projects" => Some(Self::ActiveProjects),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -102,6 +120,34 @@ impl WorkspaceId {
     }
 }
 
+/// The durable identity and location of a workspace used by persisted tasks.
+///
+/// This is deliberately independent from the live discovery model so stored
+/// tasks can still be loaded when their original source root is unavailable.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct TaskWorkspace {
+    pub(crate) id: WorkspaceId,
+    pub(crate) source: WorkspaceSource,
+    pub(crate) path: PathBuf,
+    pub(crate) display_name: String,
+}
+
+impl TaskWorkspace {
+    pub(crate) fn new(
+        id: WorkspaceId,
+        source: WorkspaceSource,
+        path: impl Into<PathBuf>,
+        display_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            source,
+            path: path.into(),
+            display_name: display_name.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub(crate) struct TaskId(pub(crate) String);
 
@@ -114,17 +160,30 @@ impl TaskId {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct TaskAttachment {
     pub(crate) path: PathBuf,
+    #[serde(skip)]
+    pub(crate) file_name: Option<String>,
 }
 
 impl TaskAttachment {
     pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            file_name: None,
+        }
+    }
+
+    /// Names the stored attachment independently of its source path. Storage
+    /// validates this as one safe filename before copying any bytes.
+    pub(crate) fn with_file_name(mut self, file_name: impl Into<String>) -> Self {
+        self.file_name = Some(file_name.into());
+        self
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct NewTaskInput {
     pub(crate) workspace_id: WorkspaceId,
+    pub(crate) workspace: Option<TaskWorkspace>,
     pub(crate) title: String,
     pub(crate) description: String,
     pub(crate) priority: TaskPriority,
@@ -136,6 +195,7 @@ impl NewTaskInput {
     pub(crate) fn new(workspace_id: WorkspaceId, title: impl Into<String>) -> Self {
         Self {
             workspace_id,
+            workspace: None,
             title: title.into(),
             description: String::new(),
             priority: TaskPriority::Normal,
@@ -146,6 +206,12 @@ impl NewTaskInput {
 
     pub(crate) fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
+        self
+    }
+
+    pub(crate) fn with_workspace(mut self, workspace: TaskWorkspace) -> Self {
+        self.workspace_id = workspace.id.clone();
+        self.workspace = Some(workspace);
         self
     }
 
@@ -169,6 +235,7 @@ impl NewTaskInput {
 pub(crate) struct Task {
     pub(crate) id: TaskId,
     pub(crate) workspace_id: WorkspaceId,
+    pub(crate) workspace: Option<TaskWorkspace>,
     pub(crate) title: String,
     pub(crate) description: String,
     pub(crate) priority: TaskPriority,
@@ -177,6 +244,8 @@ pub(crate) struct Task {
     pub(crate) status: TaskStatus,
     pub(crate) terminal_pane_id: Option<String>,
     pub(crate) attention_reason: Option<String>,
+    pub(crate) created_at_ms: u64,
+    pub(crate) updated_at_ms: u64,
 }
 
 impl Task {
@@ -184,6 +253,7 @@ impl Task {
         Self {
             id,
             workspace_id: input.workspace_id,
+            workspace: input.workspace,
             title: input.title,
             description: input.description,
             priority: input.priority,
@@ -192,9 +262,14 @@ impl Task {
             status: TaskStatus::Pending,
             terminal_pane_id: None,
             attention_reason: None,
+            created_at_ms: task_timestamp_now(),
+            updated_at_ms: task_timestamp_now(),
         }
     }
 
+    // Task 2 persists creation and loading only. Durable status-update methods
+    // are intentionally deferred; a future store update must commit before it
+    // mutates this in-memory state.
     pub(crate) fn mark_launched(
         &mut self,
         terminal_pane_id: impl Into<String>,
@@ -261,6 +336,17 @@ impl Task {
                 status: self.status,
             })
         }
+    }
+}
+
+impl From<&DiscoveredWorkspace> for TaskWorkspace {
+    fn from(workspace: &DiscoveredWorkspace) -> Self {
+        Self::new(
+            workspace.id.clone(),
+            workspace.source,
+            workspace.path.clone(),
+            workspace.display_name.clone(),
+        )
     }
 }
 
@@ -401,6 +487,51 @@ impl TaskQueueModel {
         self.tasks.insert(task.id.clone(), task);
     }
 
+    /// Persists before updating the model, so a write failure cannot create an
+    /// in-memory task that disappears on the next load.
+    pub(crate) fn create_with_store(
+        &mut self,
+        store: &TaskStore,
+        input: NewTaskInput,
+    ) -> Result<Task, TaskStoreError> {
+        let input = if input.workspace.is_some() {
+            input
+        } else {
+            let workspace = self
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == input.workspace_id)
+                .ok_or(TaskStoreError::WorkspaceMetadataMissing)?;
+            input.with_workspace(TaskWorkspace::from(workspace))
+        };
+        let task = store.create(input)?;
+        self.insert_task(task.clone());
+        Ok(task)
+    }
+
+    /// Replaces the in-memory task snapshot with the valid entries loaded by
+    /// storage. Individual malformed task files are returned for the caller to
+    /// surface without hiding the remaining valid tasks.
+    pub(crate) fn load_from_store(
+        &mut self,
+        store: &TaskStore,
+    ) -> Result<Vec<TaskLoadError>, TaskStoreError> {
+        let loaded = store.list()?;
+        self.tasks = loaded
+            .tasks
+            .into_iter()
+            .map(|task| (task.id.clone(), task))
+            .collect();
+        if self
+            .selected_task_id
+            .as_ref()
+            .is_some_and(|task_id| !self.tasks.contains_key(task_id))
+        {
+            self.selected_task_id = None;
+        }
+        Ok(loaded.errors)
+    }
+
     pub(crate) fn task(&self, task_id: &TaskId) -> Option<&Task> {
         self.tasks.get(task_id)
     }
@@ -516,6 +647,15 @@ fn normalize_path(path: &Path) -> PathBuf {
 #[cfg(unix)]
 fn path_identity_bytes(path: &Path) -> Vec<u8> {
     path.as_os_str().as_bytes().to_vec()
+}
+
+fn task_timestamp_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(windows)]

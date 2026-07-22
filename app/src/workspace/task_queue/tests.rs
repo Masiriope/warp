@@ -7,9 +7,302 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 
 use super::{
-    AgentKind, NewTaskInput, Task, TaskId, TaskPriority, TaskQueueError, TaskQueueModel,
-    TaskStatus, WorkspaceId, WorkspaceRoot, WorkspaceSource, default_sources,
+    AgentKind, NewTaskInput, Task, TaskAttachment, TaskId, TaskPriority, TaskQueueError,
+    TaskQueueModel, TaskStatus, TaskStore, TaskWorkspace, WorkspaceId, WorkspaceRoot,
+    WorkspaceSource, default_sources,
 };
+
+fn stored_workspace(root: &Path) -> TaskWorkspace {
+    TaskWorkspace::new(
+        WorkspaceId::new("workspace-1"),
+        WorkspaceSource::Github,
+        root,
+        "workspace-1",
+    )
+}
+
+fn stored_task_input(workspace: TaskWorkspace) -> NewTaskInput {
+    NewTaskInput::new(workspace.id.clone(), "Persist task queue")
+        .with_workspace(workspace)
+        .with_description("## Context\n\nKeep this local.")
+        .with_priority(TaskPriority::High)
+        .with_agent_kind(AgentKind::ClaudeCode)
+}
+
+#[test]
+fn creating_a_task_persists_markdown_and_local_attachment_bytes() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let attachment = data.path().join("notes.txt");
+    fs::write(&attachment, b"attachment bytes").expect("attachment should be created");
+    let store = TaskStore::open(data.path());
+    assert_eq!(store.root(), data.path().join("TaskQueue/v1"));
+
+    let task = store
+        .create(
+            stored_task_input(stored_workspace(workspace.path()))
+                .with_attachments(vec![TaskAttachment::new(&attachment)]),
+        )
+        .expect("task should persist");
+
+    let task_dir = store.task_directory(&task.workspace_id, &task.id);
+    let markdown =
+        fs::read_to_string(task_dir.join("task.md")).expect("task markdown should exist");
+    assert!(markdown.starts_with("---\n"));
+    assert!(markdown.contains("status: \"pending\""));
+    assert!(markdown.contains("title: \"Persist task queue\""));
+    assert!(markdown.contains("priority: \"high\""));
+    assert!(markdown.contains("workspace_path:"));
+    assert!(markdown.contains("created_at_ms:"));
+    assert!(markdown.contains("attachments:\n  - \"attachments/notes.txt\""));
+    assert!(markdown.ends_with("## Context\n\nKeep this local."));
+    assert_eq!(
+        fs::read(task_dir.join("attachments/notes.txt")).expect("attachment should be copied"),
+        b"attachment bytes"
+    );
+    assert_eq!(task.attachments[0].path, Path::new("attachments/notes.txt"));
+}
+
+#[test]
+fn attachment_write_failure_leaves_no_visible_task_or_list_entry() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+
+    let result = store.create(
+        stored_task_input(stored_workspace(workspace.path()))
+            .with_attachments(vec![TaskAttachment::new(data.path().join("missing.txt"))]),
+    );
+
+    assert!(result.is_err());
+    assert!(
+        store
+            .list()
+            .expect("task list should load")
+            .tasks
+            .is_empty()
+    );
+    assert!(
+        !data.path().join("TaskQueue/v1/tasks/workspace-1").exists(),
+        "failed writes must not expose a task directory"
+    );
+}
+
+#[test]
+fn unsafe_attachment_destination_names_are_rejected_before_a_task_is_visible() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let attachment = data.path().join("notes.txt");
+    fs::write(&attachment, "attachment").expect("attachment should be created");
+    let store = TaskStore::open(data.path());
+
+    let result = store.create(
+        stored_task_input(stored_workspace(workspace.path())).with_attachments(vec![
+            TaskAttachment::new(attachment).with_file_name("../outside.txt"),
+        ]),
+    );
+
+    assert!(result.is_err());
+    assert!(
+        store
+            .list()
+            .expect("task list should load")
+            .tasks
+            .is_empty()
+    );
+    assert!(!data.path().join("TaskQueue/v1/tasks").exists());
+}
+
+#[test]
+fn stored_tasks_round_trip_metadata_context_and_attachment_references() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let attachment = data.path().join("design.md");
+    fs::write(&attachment, "design context").expect("attachment should be created");
+    let store = TaskStore::open(data.path());
+    let created = store
+        .create(
+            stored_task_input(stored_workspace(workspace.path()))
+                .with_attachments(vec![TaskAttachment::new(&attachment)]),
+        )
+        .expect("task should persist");
+
+    let loaded = store.list().expect("task list should load");
+
+    assert!(loaded.errors.is_empty());
+    assert_eq!(loaded.tasks, vec![created]);
+}
+
+#[test]
+fn front_matter_escapes_newlines_so_task_fields_cannot_inject_headers() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace_directory = tempfile::tempdir().expect("workspace should be created");
+    let workspace = TaskWorkspace::new(
+        WorkspaceId::new("workspace-1"),
+        WorkspaceSource::Github,
+        workspace_directory.path(),
+        "workspace-1",
+    );
+    let store = TaskStore::open(data.path());
+    let title = "A title\n---\nstatus: done";
+
+    let task = store
+        .create(NewTaskInput::new(workspace.id.clone(), title).with_workspace(workspace))
+        .expect("task should persist");
+    let markdown = fs::read_to_string(
+        store
+            .task_directory(&task.workspace_id, &task.id)
+            .join("task.md"),
+    )
+    .expect("task markdown should exist");
+    let loaded = store.list().expect("task should parse again");
+
+    assert!(markdown.contains("title: \"A title\\n---\\nstatus: done\""));
+    assert_eq!(loaded.tasks, vec![task]);
+}
+
+#[test]
+fn malformed_markdown_reports_an_inspectable_load_error_without_hiding_valid_tasks() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+    let valid = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("valid task should persist");
+    let broken = data
+        .path()
+        .join("TaskQueue/v1/tasks/workspace-1/broken-task");
+    fs::create_dir_all(&broken).expect("broken task directory should be created");
+    fs::write(
+        broken.join("task.md"),
+        "---\nstatus: pending\n---\nmissing fields",
+    )
+    .expect("broken markdown should be written");
+
+    let loaded = store
+        .list()
+        .expect("task list should continue after a parse error");
+
+    assert_eq!(loaded.tasks, vec![valid]);
+    assert_eq!(loaded.errors.len(), 1);
+    assert_eq!(loaded.errors[0].path, broken.join("task.md"));
+    assert!(loaded.errors[0].reason.contains("missing"));
+}
+
+#[test]
+fn missing_workspace_path_loads_task_as_attention_required_without_deleting_it() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+    let created = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("task should persist");
+    let workspace_path = workspace.path().to_path_buf();
+    fs::remove_dir_all(&workspace_path).expect("workspace should be removed");
+
+    let loaded = store.list().expect("task list should load");
+
+    assert_eq!(loaded.tasks.len(), 1);
+    assert_eq!(loaded.tasks[0].id, created.id);
+    assert_eq!(loaded.tasks[0].status, TaskStatus::AttentionRequired);
+    assert!(
+        loaded.tasks[0]
+            .attention_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("workspace_path_missing"))
+    );
+    assert!(
+        store
+            .task_directory(&created.workspace_id, &created.id)
+            .exists()
+    );
+}
+
+#[test]
+fn direct_create_failure_never_exposes_a_half_written_task() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+    let missing = data.path().join("unreadable-source.txt");
+
+    assert!(
+        store
+            .create(
+                stored_task_input(stored_workspace(workspace.path()))
+                    .with_attachments(vec![TaskAttachment::new(missing)]),
+            )
+            .is_err()
+    );
+
+    let tasks_root = data.path().join("TaskQueue/v1/tasks");
+    assert!(
+        !tasks_root.exists()
+            || fs::read_dir(tasks_root)
+                .expect("tasks root should be readable")
+                .next()
+                .is_none()
+    );
+}
+
+#[test]
+fn model_inserts_a_task_only_after_the_store_persists_it() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+    let mut model = TaskQueueModel::new();
+
+    let task = model
+        .create_with_store(
+            &store,
+            stored_task_input(stored_workspace(workspace.path())),
+        )
+        .expect("task should persist before entering the model");
+
+    assert_eq!(model.task(&task.id), Some(&task));
+}
+
+#[test]
+fn model_uses_discovered_workspace_metadata_when_persisting_an_input_by_id() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let sources = tempfile::tempdir().expect("workspace sources should be created");
+    let github = sources.path().join("github");
+    fs::create_dir_all(github.join("workspace-1")).expect("workspace should be created");
+    let mut model =
+        TaskQueueModel::from_roots(vec![WorkspaceRoot::new(WorkspaceSource::Github, github)]);
+    let workspace_id = model.workspaces()[0].id.clone();
+    let store = TaskStore::open(data.path());
+
+    let task = model
+        .create_with_store(
+            &store,
+            NewTaskInput::new(workspace_id, "Use discovered metadata"),
+        )
+        .expect("discovered workspace should supply durable metadata");
+
+    assert!(task.workspace.is_some());
+    assert_eq!(
+        store.list().expect("task list should load").tasks,
+        vec![task]
+    );
+}
+
+#[test]
+fn model_can_load_persisted_tasks_without_coupling_storage_to_ui() {
+    let data = tempfile::tempdir().expect("data directory should be created");
+    let workspace = tempfile::tempdir().expect("workspace should be created");
+    let store = TaskStore::open(data.path());
+    let task = store
+        .create(stored_task_input(stored_workspace(workspace.path())))
+        .expect("task should persist");
+    let mut model = TaskQueueModel::new();
+
+    let errors = model
+        .load_from_store(&store)
+        .expect("persisted task should load into the model");
+
+    assert!(errors.is_empty());
+    assert_eq!(model.task(&task.id), Some(&task));
+}
 
 #[test]
 fn discovers_direct_child_workspaces_in_their_source_groups() {
