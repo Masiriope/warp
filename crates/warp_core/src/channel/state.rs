@@ -81,6 +81,16 @@ impl ChannelState {
         *CHANNEL_STATE.lock() = state;
     }
 
+    /// Replaces the process-wide channel state and returns the state that was
+    /// previously installed.
+    ///
+    /// Callers that temporarily need a different channel (for example, a
+    /// schema generator evaluating channel-dependent defaults) should restore
+    /// the returned state before they finish.
+    pub fn replace(state: ChannelState) -> Self {
+        std::mem::replace(&mut *CHANNEL_STATE.lock(), state)
+    }
+
     pub fn is_release_bundle() -> bool {
         cfg!(feature = "release_bundle")
     }

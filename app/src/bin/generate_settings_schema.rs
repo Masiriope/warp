@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //! ```
-//! cargo run --bin generate_settings_schema -- [--channel dev|preview|stable] [output_path]
+//! cargo run --bin generate_settings_schema -- [--channel dev|preview|stable|oss] [output_path]
 //! ```
 
 use std::collections::HashSet;
@@ -12,6 +12,8 @@ use schemars::SchemaGenerator;
 use serde_json::{Map, Value};
 use settings::schema::SettingSchemaEntry;
 use settings::{SettingSurfaces, SettingsMode};
+use warp_core::AppId;
+use warp_core::channel::{Channel, ChannelConfig, ChannelState, OzConfig, WarpServerConfig};
 use warp_core::features::{DEBUG_FLAGS, DOGFOOD_FLAGS, FeatureFlag, PREVIEW_FLAGS, RELEASE_FLAGS};
 
 /// Ensures all `inventory::submit!` registrations from the app crate's
@@ -85,15 +87,26 @@ fn strip_empty_enum_entries(value: &mut Value) {
     }
 }
 
-fn active_flags_for_channel(channel: &str) -> HashSet<FeatureFlag> {
+fn schema_channel(channel: &str) -> Channel {
+    match channel {
+        "stable" => Channel::Stable,
+        "preview" => Channel::Preview,
+        "dev" => Channel::Dev,
+        "oss" => Channel::Oss,
+        other => {
+            eprintln!("Unknown channel '{other}', defaulting to dev");
+            Channel::Dev
+        }
+    }
+}
+
+fn active_flags_for_channel(channel: Channel) -> HashSet<FeatureFlag> {
     let mut flags = HashSet::new();
 
     let flag_lists: &[&[FeatureFlag]] = match channel {
-        "stable" => &[RELEASE_FLAGS],
-        "preview" => &[RELEASE_FLAGS, PREVIEW_FLAGS],
-        "dev" => &[RELEASE_FLAGS, PREVIEW_FLAGS, DOGFOOD_FLAGS, DEBUG_FLAGS],
-        other => {
-            eprintln!("Unknown channel '{other}', defaulting to dev");
+        Channel::Stable | Channel::Oss | Channel::Integration => &[RELEASE_FLAGS],
+        Channel::Preview => &[RELEASE_FLAGS, PREVIEW_FLAGS],
+        Channel::Dev | Channel::Local => {
             &[RELEASE_FLAGS, PREVIEW_FLAGS, DOGFOOD_FLAGS, DEBUG_FLAGS]
         }
     };
@@ -105,6 +118,42 @@ fn active_flags_for_channel(channel: &str) -> HashSet<FeatureFlag> {
     }
 
     flags
+}
+
+fn schema_channel_state(channel: Channel) -> ChannelState {
+    ChannelState::new(
+        channel,
+        ChannelConfig {
+            app_id: AppId::new("dev", "warp", "WarpSettingsSchema"),
+            logfile_name: "".into(),
+            server_config: WarpServerConfig::production(),
+            oz_config: OzConfig::production(),
+            telemetry_config: None,
+            autoupdate_config: None,
+            crash_reporting_config: None,
+            mcp_static_config: None,
+        },
+    )
+}
+
+struct SchemaChannelStateGuard {
+    previous: Option<ChannelState>,
+}
+
+impl SchemaChannelStateGuard {
+    fn install(channel: Channel) -> Self {
+        Self {
+            previous: Some(ChannelState::replace(schema_channel_state(channel))),
+        }
+    }
+}
+
+impl Drop for SchemaChannelStateGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            ChannelState::set(previous);
+        }
+    }
 }
 
 /// Creates intermediate hierarchy objects so that a setting at e.g.
@@ -147,33 +196,11 @@ fn setting_surface_names(surfaces: SettingSurfaces) -> Vec<Value> {
         .map(|(_, name)| Value::String(name.to_owned()))
         .collect()
 }
-fn main() {
+
+fn generate_schema(channel_name: &str) -> (Value, usize) {
     ensure_settings_linked();
-
-    let args: Vec<String> = std::env::args().collect();
-
-    let mut channel = "dev";
-    let mut output_path: Option<&str> = None;
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--channel" => {
-                i += 1;
-                if i < args.len() {
-                    channel = &args[i];
-                }
-            }
-            arg if !arg.starts_with('-') => {
-                output_path = Some(arg);
-            }
-            other => {
-                eprintln!("Unknown argument: {other}");
-                std::process::exit(1);
-            }
-        }
-        i += 1;
-    }
-
+    let channel = schema_channel(channel_name);
+    let _channel_guard = SchemaChannelStateGuard::install(channel);
     let active_flags = active_flags_for_channel(channel);
     let mut generator = SchemaGenerator::default();
     let mut root_properties = Map::new();
@@ -249,7 +276,7 @@ fn main() {
     root.insert(
         "description".to_string(),
         Value::String(format!(
-            "JSON Schema for Warp settings ({channel} channel, {entry_count} settings)"
+            "JSON Schema for Warp settings ({channel_name} channel, {entry_count} settings)"
         )),
     );
     root.insert("type".to_string(), Value::String("object".to_string()));
@@ -265,6 +292,36 @@ fn main() {
     let mut root_value = Value::Object(root);
     strip_numeric_metadata(&mut root_value);
     strip_empty_enum_entries(&mut root_value);
+
+    (root_value, entry_count)
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    let mut channel = "dev";
+    let mut output_path: Option<&str> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--channel" => {
+                i += 1;
+                if i < args.len() {
+                    channel = &args[i];
+                }
+            }
+            arg if !arg.starts_with('-') => {
+                output_path = Some(arg);
+            }
+            other => {
+                eprintln!("Unknown argument: {other}");
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    let (root_value, entry_count) = generate_schema(channel);
 
     let output = serde_json::to_string_pretty(&root_value).expect("schema should serialize");
 

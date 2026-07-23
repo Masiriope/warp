@@ -1,4 +1,12 @@
 use super::*;
+use warp_core::channel::ChannelState;
+
+fn vertical_tabs_default(schema: &Value) -> bool {
+    schema
+        .pointer("/properties/appearance/properties/vertical_tabs/properties/enabled/default")
+        .and_then(Value::as_bool)
+        .expect("vertical tabs default should be a boolean")
+}
 
 #[test]
 fn surface_annotation_matches_setting_schema_entry_metadata() {
@@ -29,4 +37,17 @@ fn surface_annotation_matches_setting_schema_entry_metadata() {
             entry.storage_key
         );
     }
+}
+
+#[test]
+fn generated_schema_uses_the_requested_channel_without_leaking_channel_state() {
+    let original_channel = ChannelState::channel();
+
+    let (stable_schema, _) = generate_schema("stable");
+    assert!(!vertical_tabs_default(&stable_schema));
+    assert_eq!(ChannelState::channel(), original_channel);
+
+    let (oss_schema, _) = generate_schema("oss");
+    assert!(vertical_tabs_default(&oss_schema));
+    assert_eq!(ChannelState::channel(), original_channel);
 }
