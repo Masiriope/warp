@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::io::Write;
+use std::sync::{Mutex, MutexGuard};
 
 use schemars::SchemaGenerator;
 use serde_json::{Map, Value};
@@ -136,16 +137,32 @@ fn schema_channel_state(channel: Channel) -> ChannelState {
     )
 }
 
+/// ChannelState is process-global, while schema defaults may depend on it.
+/// Hold this lock for the entire generation so concurrent invocations cannot
+/// observe or restore each other's temporary channel.
+static SCHEMA_CHANNEL_STATE_LOCK: Mutex<()> = Mutex::new(());
+
 struct SchemaChannelStateGuard {
+    _generation_lock: MutexGuard<'static, ()>,
     previous: Option<ChannelState>,
 }
 
 impl SchemaChannelStateGuard {
     fn install(channel: Channel) -> Self {
+        let generation_lock = SCHEMA_CHANNEL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self {
+            _generation_lock: generation_lock,
             previous: Some(ChannelState::replace(schema_channel_state(channel))),
         }
     }
+}
+
+#[cfg(test)]
+fn with_schema_channel_state<R>(channel: Channel, build_schema: impl FnOnce() -> R) -> R {
+    let _channel_guard = SchemaChannelStateGuard::install(channel);
+    build_schema()
 }
 
 impl Drop for SchemaChannelStateGuard {
