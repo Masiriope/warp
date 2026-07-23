@@ -1,8 +1,11 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use ai::index::full_source_code_embedding::manager::CodebaseIndexManager;
 use ai::project_context::model::ProjectContextModel;
 use pane_group::{NotebookPane, PaneState, SplitPaneState, TerminalPaneId};
+use pathfinder_geometry::vector::vec2f;
 #[cfg(feature = "local_fs")]
 use repo_metadata::CanonicalizedPath;
 #[cfg(feature = "local_fs")]
@@ -18,7 +21,10 @@ use warp_editor::editor::NavigationKey;
 #[cfg(feature = "local_fs")]
 use warp_files::FileModel;
 use warpui::platform::WindowStyle;
-use warpui::{AddSingletonModel, App, ViewHandle};
+use warpui::{
+    AddSingletonModel, App, EntityIdSet, Event as UiEvent, Presenter, ViewHandle,
+    WindowInvalidation,
+};
 use watcher::HomeDirectoryWatcher;
 
 use super::*;
@@ -3637,6 +3643,132 @@ fn test_vertical_tabs_panel_visibility_restores_from_window_snapshot() {
                 super::vertical_tabs::VerticalSidebarMode::Tasks
             );
         });
+    });
+}
+
+#[test]
+fn vertical_sidebar_mode_toggle_handles_real_clicks_across_a_rerender() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+            });
+        });
+
+        let workspace = mock_workspace(&mut app);
+        let window_id = workspace.read(&app, |workspace, _| workspace.window_id);
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.vertical_tabs_panel_open = true;
+            workspace.vertical_tabs_panel.show_sessions();
+            ctx.notify();
+        });
+
+        let root_view_id = app
+            .root_view_id(window_id)
+            .expect("workspace window should have a root view");
+        let presenter = Rc::new(RefCell::new(Presenter::new(window_id)));
+        let invalidation = WindowInvalidation {
+            updated: EntityIdSet::from_iter([root_view_id]),
+            ..Default::default()
+        };
+        let render = |app: &mut App| {
+            app.update(|ctx| {
+                presenter.borrow_mut().invalidate(invalidation.clone(), ctx);
+                presenter
+                    .borrow_mut()
+                    .build_scene(vec2f(1000., 800.), 1., None, ctx);
+            });
+        };
+        let click_with_intermediate_rerender = |app: &mut App, position| {
+            app.update(|ctx| {
+                ctx.simulate_window_event(
+                    UiEvent::LeftMouseDown {
+                        position,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        is_first_mouse: false,
+                    },
+                    window_id,
+                    presenter.clone(),
+                );
+            });
+            // A notify between mouse-down and mouse-up recreates the render
+            // tree. This is the path that loses a per-render mouse handle.
+            render(app);
+            app.update(|ctx| {
+                ctx.simulate_window_event(
+                    UiEvent::LeftMouseUp {
+                        position,
+                        modifiers: Default::default(),
+                    },
+                    window_id,
+                    presenter.clone(),
+                );
+            });
+            render(app);
+        };
+
+        render(&mut app);
+        let tasks_toggle_center = app
+            .read(|ctx| {
+                ctx.element_position_by_id_at_last_frame(
+                    window_id,
+                    super::vertical_tabs::VERTICAL_TABS_TASKS_TOGGLE_POSITION_ID,
+                )
+            })
+            .expect("tasks toggle should be rendered")
+            .center();
+        click_with_intermediate_rerender(&mut app, tasks_toggle_center);
+
+        workspace.read(&app, |workspace, ctx| {
+            assert_eq!(
+                workspace.vertical_tabs_panel.sidebar_mode(),
+                super::vertical_tabs::VerticalSidebarMode::Tasks
+            );
+            assert_eq!(
+                workspace
+                    .snapshot(window_id, false, ctx)
+                    .vertical_sidebar_mode,
+                super::vertical_tabs::VerticalSidebarMode::Tasks,
+                "the clicked action must persist the selected sidebar mode"
+            );
+        });
+        assert!(
+            app.read(|ctx| ctx.element_position_by_id_at_last_frame(
+                window_id,
+                super::vertical_tabs::VERTICAL_TABS_TASKS_BODY_POSITION_ID,
+            ))
+            .is_some(),
+            "clicking Tareas should render the task queue body"
+        );
+
+        let sessions_toggle_center = app
+            .read(|ctx| {
+                ctx.element_position_by_id_at_last_frame(
+                    window_id,
+                    super::vertical_tabs::VERTICAL_TABS_SESSIONS_TOGGLE_POSITION_ID,
+                )
+            })
+            .expect("sessions toggle should stay rendered")
+            .center();
+        click_with_intermediate_rerender(&mut app, sessions_toggle_center);
+
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(
+                workspace.vertical_tabs_panel.sidebar_mode(),
+                super::vertical_tabs::VerticalSidebarMode::Sessions
+            );
+        });
+        assert!(
+            app.read(|ctx| ctx.element_position_by_id_at_last_frame(
+                window_id,
+                super::vertical_tabs::VERTICAL_TABS_SESSIONS_BODY_POSITION_ID,
+            ))
+            .is_some(),
+            "clicking Sesiones should restore the sessions body"
+        );
     });
 }
 

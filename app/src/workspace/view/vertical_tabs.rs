@@ -717,6 +717,8 @@ pub(super) struct VerticalTabsPanelState {
     new_tab_button_state: MouseStateHandle,
     pub(super) search_query: String,
     sidebar_mode: VerticalSidebarMode,
+    sessions_sidebar_mode_mouse_state: MouseStateHandle,
+    tasks_sidebar_mode_mouse_state: MouseStateHandle,
     task_panel_selection: Arc<Mutex<TaskPanelSelection>>,
     settings_button_mouse_state: MouseStateHandle,
     panes_segment_mouse_state: MouseStateHandle,
@@ -757,6 +759,8 @@ impl Default for VerticalTabsPanelState {
             new_tab_button_state: Default::default(),
             search_query: String::new(),
             sidebar_mode: VerticalSidebarMode::Sessions,
+            sessions_sidebar_mode_mouse_state: Default::default(),
+            tasks_sidebar_mode_mouse_state: Default::default(),
             task_panel_selection: Arc::new(Mutex::new(TaskPanelSelection::default())),
             settings_button_mouse_state: Default::default(),
             panes_segment_mouse_state: Default::default(),
@@ -1309,6 +1313,10 @@ const CONTROL_BAR_BUTTON_RADIUS: Radius = Radius::Pixels(4.);
 const SPLIT_BUTTON_HEIGHT: f32 = SEARCH_BAR_HEIGHT;
 pub(super) const VERTICAL_TABS_ADD_TAB_POSITION_ID: &str = "vertical_tabs_add_tab_button";
 pub(super) const VERTICAL_TABS_SETTINGS_BUTTON_POSITION_ID: &str = "vertical_tabs_settings_button";
+pub(super) const VERTICAL_TABS_SESSIONS_TOGGLE_POSITION_ID: &str = "vertical_tabs_sessions_toggle";
+pub(super) const VERTICAL_TABS_TASKS_TOGGLE_POSITION_ID: &str = "vertical_tabs_tasks_toggle";
+pub(super) const VERTICAL_TABS_SESSIONS_BODY_POSITION_ID: &str = "vertical_tabs_sessions_body";
+pub(super) const VERTICAL_TABS_TASKS_BODY_POSITION_ID: &str = "vertical_tabs_tasks_body";
 
 pub(super) fn vtab_action_buttons_position_id(tab_index: usize) -> String {
     format!("vtab_action_buttons_{tab_index}")
@@ -1531,32 +1539,36 @@ fn render_vertical_sidebar_mode_toggle(
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
-    let render_segment =
-        |label: &'static str, mode: VerticalSidebarMode, action: WorkspaceAction| {
-            let is_selected = state.sidebar_mode() == mode;
-            let text_color = if is_selected {
-                theme.main_text_color(theme.background())
-            } else {
-                theme.sub_text_color(theme.background())
-            };
-            let segment = Container::new(
-                Text::new_inline(label, appearance.ui_font_family(), 11.)
-                    .with_color(text_color.into())
-                    .finish(),
-            )
-            .with_padding(Padding::uniform(0.).with_horizontal(8.).with_vertical(5.))
-            .with_corner_radius(CornerRadius::with_all(CONTROL_BAR_BUTTON_RADIUS));
-            let segment = if is_selected {
-                segment.with_background(internal_colors::fg_overlay_3(theme))
-            } else {
-                segment
-            }
-            .finish();
-            Hoverable::new(MouseStateHandle::default(), move |_| segment)
-                .with_cursor(Cursor::PointingHand)
-                .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
-                .finish()
+    let render_segment = |label: &'static str,
+                          mode: VerticalSidebarMode,
+                          action: WorkspaceAction,
+                          mouse_state: MouseStateHandle,
+                          position_id: &'static str| {
+        let is_selected = state.sidebar_mode() == mode;
+        let text_color = if is_selected {
+            theme.main_text_color(theme.background())
+        } else {
+            theme.sub_text_color(theme.background())
         };
+        let segment = Container::new(
+            Text::new_inline(label, appearance.ui_font_family(), 11.)
+                .with_color(text_color.into())
+                .finish(),
+        )
+        .with_padding(Padding::uniform(0.).with_horizontal(8.).with_vertical(5.))
+        .with_corner_radius(CornerRadius::with_all(CONTROL_BAR_BUTTON_RADIUS));
+        let segment = if is_selected {
+            segment.with_background(internal_colors::fg_overlay_3(theme))
+        } else {
+            segment
+        }
+        .finish();
+        let segment = Hoverable::new(mouse_state, move |_| segment)
+            .with_cursor(Cursor::PointingHand)
+            .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+            .finish();
+        SavePosition::new(segment, position_id).finish()
+    };
 
     Container::new(
         Flex::row()
@@ -1567,11 +1579,15 @@ fn render_vertical_sidebar_mode_toggle(
                 "Sesiones",
                 VerticalSidebarMode::Sessions,
                 WorkspaceAction::ShowSessions,
+                state.sessions_sidebar_mode_mouse_state.clone(),
+                VERTICAL_TABS_SESSIONS_TOGGLE_POSITION_ID,
             ))
             .with_child(render_segment(
                 "Tareas",
                 VerticalSidebarMode::Tasks,
                 WorkspaceAction::ShowTaskQueue,
+                state.tasks_sidebar_mode_mouse_state.clone(),
+                VERTICAL_TABS_TASKS_TOGGLE_POSITION_ID,
             ))
             .finish(),
     )
@@ -1804,10 +1820,16 @@ fn render_vertical_tabs_panel(
         .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
         .with_child(render_vertical_sidebar_mode_toggle(state, app))
         .with_child(match state.sidebar_mode() {
-            VerticalSidebarMode::Sessions => render_groups(state, workspace, app),
-            VerticalSidebarMode::Tasks => {
-                render_task_queue_panel(state.task_panel_selection(), &state.search_query, app)
-            }
+            VerticalSidebarMode::Sessions => SavePosition::new(
+                render_groups(state, workspace, app),
+                VERTICAL_TABS_SESSIONS_BODY_POSITION_ID,
+            )
+            .finish(),
+            VerticalSidebarMode::Tasks => SavePosition::new(
+                render_task_queue_panel(state.task_panel_selection(), &state.search_query, app),
+                VERTICAL_TABS_TASKS_BODY_POSITION_ID,
+            )
+            .finish(),
         })
         .finish();
 
