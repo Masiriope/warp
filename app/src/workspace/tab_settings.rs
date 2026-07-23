@@ -3,7 +3,15 @@ use std::path::Path;
 
 use settings::macros::define_settings_group;
 use settings::{RespectUserSyncSetting, SupportedPlatforms, SyncToCloud};
+use warp_core::channel::{Channel, ChannelState};
 use warp_core::ui::theme::AnsiColorIdentifier;
+
+/// The task rail is the primary navigation in the local/OSS fork. Keep that
+/// choice a default rather than a migration so an existing explicit preference
+/// (including `false`) always wins.
+pub(crate) fn use_vertical_tabs_default_for_channel(channel: Channel) -> bool {
+    matches!(channel, Channel::Local | Channel::Oss)
+}
 
 #[derive(
     Default,
@@ -499,7 +507,7 @@ define_settings_group!(TabSettings, settings: [
     },
     use_vertical_tabs: UseVerticalTabs {
         type: bool,
-        default: false,
+        default: use_vertical_tabs_default_for_channel(ChannelState::channel()),
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
         surface: settings::SettingSurfaces::GUI,

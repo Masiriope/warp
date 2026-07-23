@@ -1,9 +1,43 @@
 use settings::Setting;
+use warp_core::channel::{Channel, ChannelState};
 use warpui::{App, SingletonEntity};
 
 use super::*;
 use crate::test_util::settings::initialize_settings_for_tests;
 use crate::workspace::header_toolbar_item::HeaderToolbarItemKind;
+
+#[test]
+fn use_vertical_tabs_default_is_scoped_to_local_and_oss_channels() {
+    assert!(use_vertical_tabs_default_for_channel(Channel::Local));
+    assert!(use_vertical_tabs_default_for_channel(Channel::Oss));
+
+    for channel in [
+        Channel::Stable,
+        Channel::Preview,
+        Channel::Dev,
+        Channel::Integration,
+    ] {
+        assert!(!use_vertical_tabs_default_for_channel(channel));
+    }
+}
+
+#[test]
+fn fresh_profile_uses_the_channel_vertical_tabs_default() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        TabSettings::handle(&app).read(&app, |settings, _ctx| {
+            assert_eq!(
+                *settings.use_vertical_tabs,
+                use_vertical_tabs_default_for_channel(ChannelState::channel())
+            );
+            assert!(
+                !settings.use_vertical_tabs.is_value_explicitly_set(),
+                "a fresh profile must not be rewritten as an explicit preference"
+            );
+        });
+    });
+}
 
 #[test]
 fn use_latest_user_prompt_as_conversation_title_in_tab_names_defaults_to_false() {

@@ -3876,6 +3876,54 @@ fn test_vertical_tabs_panel_defaults_open_for_new_window_when_vertical_tabs_enab
 }
 
 #[test]
+fn test_fresh_oss_profile_opens_the_vertical_tabs_panel() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        app.read(|ctx| {
+            let settings = TabSettings::as_ref(ctx);
+            assert!(
+                *settings.use_vertical_tabs,
+                "a fresh OSS profile should expose the Sessions/Tareas rail"
+            );
+            assert!(!settings.use_vertical_tabs.is_value_explicitly_set());
+        });
+
+        let workspace = mock_workspace(&mut app);
+        workspace.read(&app, |workspace, _| {
+            assert!(
+                workspace.vertical_tabs_panel_open,
+                "a new workspace should expose the Sessions/Tareas rail"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_explicitly_disabled_vertical_tabs_keep_the_new_workspace_panel_closed() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(false, ctx));
+            });
+        });
+
+        let workspace = mock_workspace(&mut app);
+        workspace.read(&app, |workspace, _| {
+            assert!(
+                !workspace.vertical_tabs_panel_open,
+                "an explicit false must override the local/OSS default"
+            );
+        });
+    });
+}
+
+#[test]
 fn test_vertical_tabs_panel_inherits_transferred_tab_source_window_state() {
     let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
 
@@ -3917,6 +3965,11 @@ fn test_vertical_tabs_panel_auto_shows_when_setting_enabled() {
 
     App::test((), |mut app| async move {
         initialize_app(&mut app);
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(false, ctx));
+            });
+        });
 
         let workspace = mock_workspace(&mut app);
 
@@ -3955,6 +4008,11 @@ fn test_active_tab_bar_position_id_tracks_layout() {
     let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app(&mut app);
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(false, ctx));
+            });
+        });
 
         // Horizontal tabs (setting off): the horizontal bar is the drop zone.
         app.read(|ctx| {
